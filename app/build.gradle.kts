@@ -24,7 +24,7 @@ android {
       ?: "1.1"
     val githubRepoSlug = (project.findProperty("githubRepoSlug") as? String)?.takeIf { it.isNotBlank() }
       ?: System.getenv("GITHUB_REPOSITORY")?.takeIf { it.isNotBlank() }
-      ?: ""
+      ?: "albionrxdivision-svg/Jadobpursamiti-gmail.com"
     versionCode = dynamicVersionCode
     versionName = dynamicVersionName
     buildConfigField("String", "GITHUB_REPO_SLUG", "\"${githubRepoSlug.replace("\"", "")}\"")
