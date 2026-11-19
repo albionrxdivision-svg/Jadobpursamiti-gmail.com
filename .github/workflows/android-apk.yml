@@ -65,9 +65,23 @@ jobs:
           GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
         run: |
           if [ -n "$GOOGLE_SERVICES_JSON" ]; then
-            printf '%s' "$GOOGLE_SERVICES_JSON" > app/google-services.json
+            TRIMMED=$(printf '%s' "$GOOGLE_SERVICES_JSON" | tr -d '\r\n\t ')
+            if printf '%s' "$GOOGLE_SERVICES_JSON" | python3 -m json.tool > /dev/null 2>&1; then
+              printf '%s' "$GOOGLE_SERVICES_JSON" > app/google-services.json
+              echo "✅ Loaded app/google-services.json from GitHub Secret."
+            elif printf '%s' "$TRIMMED" | base64 -d > app/google-services.json 2>/dev/null && python3 -m json.tool app/google-services.json > /dev/null 2>&1; then
+              echo "✅ Decoded base64 GOOGLE_SERVICES_JSON secret into app/google-services.json."
+            else
+              echo "::error::GOOGLE_SERVICES_JSON secret is neither valid JSON nor valid base64 JSON."
+              exit 1
+            fi
           elif [ ! -f app/google-services.json ]; then
-            echo "Notice: app/google-services.json not found in repo; generating CI config for com.aistudio.ekotasamiti.jxqp"
+            echo "::warning::GOOGLE_SERVICES_JSON secret is missing. Google Sign-In & Firestore Sync will be disabled in this APK until you add Secrets -> Actions -> GOOGLE_SERVICES_JSON."
+            {
+              echo "### ⚠️ Firebase Secret Missing (GOOGLE_SERVICES_JSON)"
+              echo "This APK was compiled with a CI placeholder config, so **Google Sign-In / Cloud Sync** will show a setup warning."
+              echo "To enable Google Sign-In in GitHub APK builds, add \`GOOGLE_SERVICES_JSON\` under **Repository Settings → Secrets and variables → Actions** using the contents of \`app/google-services.json\`."
+            } >> "$GITHUB_STEP_SUMMARY"
             cat << 'EOF' > app/google-services.json
           {
             "project_info": {

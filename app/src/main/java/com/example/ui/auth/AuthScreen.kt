@@ -384,6 +384,15 @@ private suspend fun signInWithGoogleCredential(credential: Credential) {
     }
 }
 
+fun isFirebasePlaceholderBuild(context: Context): Boolean {
+    val clientId = try {
+        context.getString(R.string.default_web_client_id)
+    } catch (_: Exception) {
+        ""
+    }
+    return clientId.isBlank() || clientId.contains("ciplaceholder", ignoreCase = true)
+}
+
 fun onGoogleSignInClicked(
     context: Context,
     credentialManager: CredentialManager,
@@ -401,8 +410,8 @@ fun onGoogleSignInClicked(
 
     if (clientId.isBlank() || clientId.contains("ciplaceholder", ignoreCase = true)) {
         onAuthError(
-            "এই APK-টি আসল Firebase google-services.json ছাড়া তৈরি হয়েছে। " +
-                "Google Sign-In চালু করতে আসল google-services.json সহ নতুন APK বিল্ড করুন।"
+            "এই GitHub APK-তে Firebase কনফিগারেশন (GOOGLE_SERVICES_JSON) যুক্ত নেই।\n" +
+                "সমাধান: GitHub > Settings > Secrets and variables > Actions-এ 'GOOGLE_SERVICES_JSON' Secret হিসেবে আসল app/google-services.json যোগ করে নতুন APK বিল্ড করুন, অথবা AI Studio থেকে সরাসরি APK ডাউনলোড করুন।"
         )
         return
     }

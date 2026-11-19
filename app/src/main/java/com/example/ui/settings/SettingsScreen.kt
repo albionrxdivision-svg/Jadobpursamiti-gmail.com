@@ -1109,11 +1109,30 @@ fun OfflineCloudSyncDialog(
                         )
                     }
                 } else {
+                    val isPlaceholderBuild = remember(context) {
+                        com.example.ui.auth.isFirebasePlaceholderBuild(context)
+                    }
                     Text(
                         text = "Google লগইন করলে Firestore অফলাইন ক্যাশ চালু থাকবে — নেট ছাড়াও এন্ট্রি করা যাবে এবং নেট এলে অটো সিঙ্ক হবে।",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
+                    if (isPlaceholderBuild && authErrorMessage.isNullOrBlank()) {
+                        Surface(
+                            shape = RoundedCornerShape(8.dp),
+                            color = MaterialTheme.colorScheme.errorContainer,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("cloud_sync_placeholder_notice_box")
+                        ) {
+                            Text(
+                                text = "এই GitHub APK-তে আসল Firebase কনফিগারেশন (GOOGLE_SERVICES_JSON) নেই। ক্লাউড সিঙ্ক চালু করতে GitHub রিপোজিটরির Settings → Secrets → Actions-এ GOOGLE_SERVICES_JSON যোগ করুন অথবা AI Studio থেকে Export APK নিন। (লোকাল ও Drive ব্যাকআপ সচল আছে)",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onErrorContainer,
+                                modifier = Modifier.padding(10.dp)
+                            )
+                        }
+                    }
                     if (!authErrorMessage.isNullOrBlank()) {
                         Surface(
                             shape = RoundedCornerShape(8.dp),
