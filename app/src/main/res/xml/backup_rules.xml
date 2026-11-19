@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<full-backup-content>
+    <include domain="sharedpref" path="ekota_user_entered_data.xml" />
+    <include domain="sharedpref" path="ekota_credentials_v1.xml" />
+    <include domain="sharedpref" path="ekota_storage_prefs.xml" />
+    <include domain="database" path="ekota_offline_sync.db" />
+    <include domain="file" path="ekota_backups" />
+    <exclude domain="sharedpref" path="ekota_fcm_prefs.xml" />
+    <exclude domain="sharedpref" path="ekota_auth_session.xml" />
+</full-backup-content>

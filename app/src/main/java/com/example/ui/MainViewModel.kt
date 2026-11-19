@@ -1,0 +1,2580 @@
+package com.example.ui
+
+import android.util.Log
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewModelScope
+import com.example.ai.AiCallAssistantService
+import com.example.ai.AiCallPlanResult
+import com.example.data.local.BackupManager
+import com.example.data.local.OfflineTransactionType
+import com.example.data.local.PendingOfflineTransactionEntity
+import com.example.data.model.*
+import com.example.data.repository.EkotaRepository
+import com.example.data.repository.SyncStatusState
+import com.example.util.AppUpdateChecker
+import com.example.util.AppUpdateInfo
+import com.google.firebase.firestore.FirebaseFirestoreException
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.launch
+
+sealed interface UiState<out T> {
+    data object Loading : UiState<Nothing>
+    data class Success<T>(val data: T) : UiState<T>
+    data class Error(val message: String) : UiState<Nothing>
+}
+
+sealed interface AiCallUiState {
+    data object Idle : AiCallUiState
+    data object Loading : AiCallUiState
+    data class Success(val result: AiCallPlanResult) : AiCallUiState
+    data class Error(val message: String) : AiCallUiState
+}
+
+data class DashboardSummary(
+    val totalMembers: Int = 0,
+    val totalSavings: Double = 0.0,
+    val todaySavings: Double = 0.0,
+    val totalLoanDisbursed: Double = 0.0,
+    val totalLoanCollected: Double = 0.0,
+    val totalLoanDue: Double = 0.0,
+    val currentBalance: Double = 0.0,
+    val todayCollection: Double = 0.0,
+    val pendingApprovalsCount: Int = 0,
+    val totalFinesAssessed: Double = 0.0,
+    val totalFinesCollected: Double = 0.0,
+    val totalFinesDue: Double = 0.0
+)
+
+class MainViewModel(
+    private val repository: EkotaRepository,
+    val currentUserId: String
+) : ViewModel() {
+
+    private val _currentUserProfile = MutableStateFlow<UserProfile?>(AuthSession.currentUserProfile)
+    val currentUserProfile: StateFlow<UserProfile?> = _currentUserProfile.asStateFlow()
+
+    private val _userRole = MutableStateFlow(
+        if (AuthSession.currentUserProfile?.role == UserRole.ADMIN.name) UserRole.ADMIN else UserRole.FIELD_OFFICER
+    )
+    val userRole: StateFlow<UserRole> = _userRole.asStateFlow()
+
+    private val _allUsers = MutableStateFlow<List<UserProfile>>(emptyList())
+    val allUsers: StateFlow<List<UserProfile>> = _allUsers.asStateFlow()
+
+    private val _members = MutableStateFlow<List<Member>>(emptyList())
+    val members: StateFlow<List<Member>> = _members.asStateFlow()
+
+    private val _membersUiState = MutableStateFlow<UiState<List<Member>>>(UiState.Loading)
+    val membersUiState: StateFlow<UiState<List<Member>>> = _membersUiState.asStateFlow()
+
+    private val _isSavingBatch = MutableStateFlow(false)
+    val isSavingBatch: StateFlow<Boolean> = _isSavingBatch.asStateFlow()
+
+    private val _isSavingLoan = MutableStateFlow(false)
+    val isSavingLoan: StateFlow<Boolean> = _isSavingLoan.asStateFlow()
+
+    private val _isSavingMember = MutableStateFlow(false)
+    val isSavingMember: StateFlow<Boolean> = _isSavingMember.asStateFlow()
+
+    private val _isCloudSynced = MutableStateFlow(repository.getCurrentUser() != null)
+    val isCloudSynced: StateFlow<Boolean> = _isCloudSynced.asStateFlow()
+
+    private val _isOnline = MutableStateFlow(repository.isOnline())
+    val isOnline: StateFlow<Boolean> = _isOnline.asStateFlow()
+
+    private val _isSyncing = MutableStateFlow(false)
+    private val _isFromCache = MutableStateFlow(false)
+    private val _lastSyncedAtMillis = MutableStateFlow(0L)
+
+    private val _pendingMemberIds = MutableStateFlow<Set<String>>(emptySet())
+    private val _firestorePendingSavingsIds = MutableStateFlow<Set<String>>(emptySet())
+    private val _firestorePendingInstallmentIds = MutableStateFlow<Set<String>>(emptySet())
+    private val _roomPendingTransactions = MutableStateFlow<List<PendingOfflineTransactionEntity>>(emptyList())
+
+    val pendingSavingsIds: StateFlow<Set<String>> = combine(
+        _firestorePendingSavingsIds,
+        _roomPendingTransactions
+    ) { fsIds, roomList ->
+        fsIds + roomList.filter { it.transactionType == OfflineTransactionType.SAVINGS }.map { it.id }
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptySet())
+
+    private val _pendingLoanIds = MutableStateFlow<Set<String>>(emptySet())
+
+    val pendingInstallmentIds: StateFlow<Set<String>> = combine(
+        _firestorePendingInstallmentIds,
+        _roomPendingTransactions
+    ) { fsIds, roomList ->
+        fsIds + roomList.filter { it.transactionType == OfflineTransactionType.LOAN_INSTALLMENT }.map { it.id }
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptySet())
+
+    private val _pendingFineIds = MutableStateFlow<Set<String>>(emptySet())
+
+    private val aiCallAssistantService by lazy { AiCallAssistantService() }
+    private val _aiCallUiState = MutableStateFlow<AiCallUiState>(AiCallUiState.Idle)
+    val aiCallUiState: StateFlow<AiCallUiState> = _aiCallUiState.asStateFlow()
+
+    val syncStatus: StateFlow<SyncStatusState> = combine(
+        _isOnline,
+        _isCloudSynced,
+        _isSyncing,
+        _isFromCache,
+        combine(
+            _pendingMemberIds,
+            pendingSavingsIds,
+            _pendingLoanIds,
+            pendingInstallmentIds,
+            _pendingFineIds
+        ) { m, s, l, i, f -> m + s + l + i + f }
+    ) { online, cloudAuthed, syncing, fromCache, allPendingIds ->
+        SyncStatusState(
+            isOnline = online,
+            isCloudAuthenticated = cloudAuthed,
+            isSyncing = syncing,
+            isFromCache = fromCache,
+            pendingDocumentIds = allPendingIds,
+            pendingCount = allPendingIds.size,
+            lastSyncedAtMillis = _lastSyncedAtMillis.value
+        )
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5000),
+        initialValue = SyncStatusState(
+            isOnline = repository.isOnline(),
+            isCloudAuthenticated = repository.getCurrentUser() != null
+        )
+    )
+
+    private val _savingsRecords = MutableStateFlow<List<SavingsRecord>>(emptyList())
+    val savingsRecords: StateFlow<List<SavingsRecord>> = _savingsRecords.asStateFlow()
+
+    private val _collectionPeriods = MutableStateFlow<List<CollectionPeriod>>(emptyList())
+    val collectionPeriods: StateFlow<List<CollectionPeriod>> = _collectionPeriods.asStateFlow()
+
+    private val deletedDocIds = mutableSetOf<String>()
+
+    private val _selectedSavingsDate = MutableStateFlow(
+        repository.loadSelectedSavingsDate().ifBlank { com.example.util.BengaliUtils.getCurrentDateStr() }
+    )
+    val selectedSavingsDate: StateFlow<String> = _selectedSavingsDate.asStateFlow()
+
+    fun setSelectedSavingsDate(date: String) {
+        val normalized = com.example.util.DailyAccountCalculator.normalizeDateKey(date)
+        if (normalized.isNotBlank()) {
+            _selectedSavingsDate.value = normalized
+            repository.saveSelectedSavingsDate(normalized)
+        }
+    }
+
+    private val _selectedLoanDate = MutableStateFlow(
+        repository.loadSelectedLoanDate().ifBlank { com.example.util.BengaliUtils.getCurrentDateStr() }
+    )
+    val selectedLoanDate: StateFlow<String> = _selectedLoanDate.asStateFlow()
+
+    fun setSelectedLoanDate(date: String) {
+        val normalized = com.example.util.DailyAccountCalculator.normalizeDateKey(date)
+        if (normalized.isNotBlank()) {
+            _selectedLoanDate.value = normalized
+            repository.saveSelectedLoanDate(normalized)
+        }
+    }
+
+    private val _selectedFineDate = MutableStateFlow(
+        repository.loadSelectedFineDate().ifBlank { com.example.util.BengaliUtils.getCurrentDateStr() }
+    )
+    val selectedFineDate: StateFlow<String> = _selectedFineDate.asStateFlow()
+
+    fun setSelectedFineDate(date: String) {
+        val normalized = com.example.util.DailyAccountCalculator.normalizeDateKey(date)
+        if (normalized.isNotBlank()) {
+            _selectedFineDate.value = normalized
+            repository.saveSelectedFineDate(normalized)
+        }
+    }
+
+    private val _loans = MutableStateFlow<List<Loan>>(emptyList())
+    val loans: StateFlow<List<Loan>> = _loans.asStateFlow()
+
+    private val _loanInstallments = MutableStateFlow<List<LoanInstallment>>(emptyList())
+    val loanInstallments: StateFlow<List<LoanInstallment>> = _loanInstallments.asStateFlow()
+
+    private val _fines = MutableStateFlow<List<FineRecord>>(emptyList())
+    val fines: StateFlow<List<FineRecord>> = _fines.asStateFlow()
+
+    private val _fundLedger = MutableStateFlow<List<FundLedgerEntry>>(emptyList())
+    val fundLedger: StateFlow<List<FundLedgerEntry>> = _fundLedger.asStateFlow()
+
+    private val _auditLogs = MutableStateFlow<List<AuditLog>>(emptyList())
+    val auditLogs: StateFlow<List<AuditLog>> = _auditLogs.asStateFlow()
+
+    private val _appSettings = MutableStateFlow(AppSettings())
+    val appSettings: StateFlow<AppSettings> = _appSettings.asStateFlow()
+
+    private val _pendingAdminNotifications = MutableStateFlow<List<AdminNotification>>(emptyList())
+    val pendingAdminNotifications: StateFlow<List<AdminNotification>> = _pendingAdminNotifications.asStateFlow()
+
+    private val _availableUpdate = MutableStateFlow<AppUpdateInfo?>(null)
+    val availableUpdate: StateFlow<AppUpdateInfo?> = _availableUpdate.asStateFlow()
+
+    private val _isCheckingUpdate = MutableStateFlow(false)
+    val isCheckingUpdate: StateFlow<Boolean> = _isCheckingUpdate.asStateFlow()
+
+    private val _updateBannerDismissed = MutableStateFlow(false)
+    val updateBannerDismissed: StateFlow<Boolean> = _updateBannerDismissed.asStateFlow()
+
+    private val _lastUpdateStatusMessage = MutableStateFlow<String?>(null)
+    val lastUpdateStatusMessage: StateFlow<String?> = _lastUpdateStatusMessage.asStateFlow()
+
+    val dashboardSummary: StateFlow<DashboardSummary> = combine(
+        combine(_members, _savingsRecords, _loans, _loanInstallments, _fundLedger) {
+            membersList, savingsList, loanList, installmentsList, ledgerList ->
+            listOf(membersList, savingsList, loanList, installmentsList, ledgerList)
+        },
+        _fines
+    ) { coreLists, finesList ->
+        @Suppress("UNCHECKED_CAST")
+        val membersList = coreLists[0] as List<Member>
+        @Suppress("UNCHECKED_CAST")
+        val savingsList = coreLists[1] as List<SavingsRecord>
+        @Suppress("UNCHECKED_CAST")
+        val loanList = coreLists[2] as List<Loan>
+        @Suppress("UNCHECKED_CAST")
+        val installmentsList = coreLists[3] as List<LoanInstallment>
+        @Suppress("UNCHECKED_CAST")
+        val ledgerList = coreLists[4] as List<FundLedgerEntry>
+
+        val today = com.example.util.BengaliUtils.getCurrentDateStr()
+        val approvedSavings = savingsList.filter { it.status == TransactionStatus.APPROVED.name }
+        val approvedInstallments = installmentsList.filter { it.status == TransactionStatus.APPROVED.name && !it.isMissed }
+
+        val totalSavings = approvedSavings.sumOf { it.amount }
+        val todaySavings = approvedSavings.filter { it.collectionDate == today }.sumOf { it.amount }
+        val totalDisbursed = loanList.sumOf { it.principal }
+        val totalCollectedLoan = approvedInstallments.sumOf { it.amount }
+        val todayLoanCollected = approvedInstallments.filter { it.installmentDate == today }.sumOf { it.amount }
+        val totalDue = loanList.filter { it.status == LoanStatus.ACTIVE.name }.sumOf { it.remainingLoan }
+
+        val latestBalance = com.example.util.DailyAccountCalculator.buildOverview(
+            savingsRecords = savingsList,
+            loanInstallments = installmentsList,
+            loans = loanList,
+            fundLedger = ledgerList
+        ).currentNetBalance
+
+        val pendingSavings = savingsList.count { it.status == TransactionStatus.PENDING.name }
+        val pendingInst = installmentsList.count { it.status == TransactionStatus.PENDING.name }
+
+        val activeFines = finesList.filter { it.status != TransactionStatus.REJECTED.name }
+        val totalFinesAssessed = activeFines.sumOf { it.amount }
+        val totalFinesCollected = activeFines.filter { it.isPaid }.sumOf { it.amount }
+        val totalFinesDue = (totalFinesAssessed - totalFinesCollected).coerceAtLeast(0.0)
+
+        DashboardSummary(
+            totalMembers = membersList.count { it.isActive },
+            totalSavings = totalSavings,
+            todaySavings = todaySavings,
+            totalLoanDisbursed = totalDisbursed,
+            totalLoanCollected = totalCollectedLoan,
+            totalLoanDue = totalDue,
+            currentBalance = latestBalance,
+            todayCollection = todaySavings + todayLoanCollected,
+            pendingApprovalsCount = pendingSavings + pendingInst,
+            totalFinesAssessed = totalFinesAssessed,
+            totalFinesCollected = totalFinesCollected,
+            totalFinesDue = totalFinesDue
+        )
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), DashboardSummary())
+
+    init {
+        initializeData()
+    }
+
+    private fun initializeData() {
+        val sessionUser = AuthSession.currentUserProfile
+        if (sessionUser != null) {
+            _currentUserProfile.value = sessionUser
+            _userRole.value = if (sessionUser.role == UserRole.ADMIN.name) UserRole.ADMIN else UserRole.FIELD_OFFICER
+        }
+
+        observeConnectivityChanges()
+        observeRoomOfflineQueue()
+
+        val firebaseUser = repository.getCurrentUser()
+        _isCloudSynced.value = firebaseUser != null
+
+        if (firebaseUser == null) {
+            // Local AuthSession mode: load only data entered by Admin / Field Officer
+            val localMembers = repository.loadLocalMembers()
+            _members.value = localMembers
+            _membersUiState.value = UiState.Success(localMembers)
+            _savingsRecords.value = repository.loadLocalSavings()
+            _collectionPeriods.value = repository.loadLocalCollectionPeriods()
+            _loans.value = repository.loadLocalLoans()
+            _loanInstallments.value = repository.loadLocalLoanInstallments()
+            _fines.value = repository.loadLocalFines()
+            _fundLedger.value = repository.loadLocalFundLedger()
+            _appSettings.value = repository.loadLocalAppSettings()
+            _pendingAdminNotifications.value = repository.loadLocalAdminNotifications().filter { !it.isRead }
+            if (_appSettings.value.autoUpdateEnabled) {
+                checkForAppUpdates(force = false)
+            }
+            return
+        }
+
+        viewModelScope.launch {
+            // Immediately warm UI from LocalDataStore + Room offline cache so ALL user entries and dates appear instantly
+            try {
+                val localMembers = repository.loadLocalMembers()
+                val cachedMembers = if (localMembers.isNotEmpty()) localMembers else repository.loadCachedMembersFromRoom()
+                if (cachedMembers.isNotEmpty() && _members.value.isEmpty()) {
+                    _members.value = cachedMembers
+                    _membersUiState.value = UiState.Success(cachedMembers)
+                }
+                val localSavings = repository.loadLocalSavings()
+                if (localSavings.isNotEmpty() && _savingsRecords.value.isEmpty()) {
+                    _savingsRecords.value = localSavings
+                }
+                val localPeriods = repository.loadLocalCollectionPeriods()
+                if (localPeriods.isNotEmpty() && _collectionPeriods.value.isEmpty()) {
+                    _collectionPeriods.value = localPeriods
+                }
+                val localLoans = repository.loadLocalLoans()
+                val cachedLoans = if (localLoans.isNotEmpty()) localLoans else repository.loadCachedLoansFromRoom()
+                if (cachedLoans.isNotEmpty() && _loans.value.isEmpty()) {
+                    _loans.value = cachedLoans
+                }
+                val localInstallments = repository.loadLocalLoanInstallments()
+                if (localInstallments.isNotEmpty() && _loanInstallments.value.isEmpty()) {
+                    _loanInstallments.value = localInstallments
+                }
+                val localFines = repository.loadLocalFines()
+                if (localFines.isNotEmpty() && _fines.value.isEmpty()) {
+                    _fines.value = localFines
+                }
+                val localLedger = repository.loadLocalFundLedger()
+                if (localLedger.isNotEmpty() && _fundLedger.value.isEmpty()) {
+                    _fundLedger.value = localLedger
+                }
+                val localSettings = repository.loadLocalAppSettings()
+                if (localSettings != AppSettings()) {
+                    _appSettings.value = localSettings
+                }
+            } catch (_: Exception) {
+            }
+
+            var resolvedAdmin = _userRole.value == UserRole.ADMIN
+            try {
+                val profile = repository.getOrCreateUserProfile(
+                    uid = firebaseUser.uid,
+                    email = firebaseUser.email ?: "",
+                    name = firebaseUser.displayName ?: "ইউজার"
+                )
+                _currentUserProfile.value = profile
+                resolvedAdmin = profile.role == UserRole.ADMIN.name
+                _userRole.value = if (resolvedAdmin) UserRole.ADMIN else UserRole.FIELD_OFFICER
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                // Continue to attach offline-cached listeners even if profile creation encountered a transient error
+            }
+
+            // Migrate any previously entered local entries & flush any pending Room transactions when online
+            launch {
+                try {
+                    repository.migrateLocalEntriesToFirestore(isAdmin = resolvedAdmin)
+                    if (repository.isOnline()) {
+                        syncPendingOfflineEntries()
+                    }
+                } catch (_: Exception) {
+                }
+            }
+
+            // Observe real-time data with MetadataChanges.INCLUDE & local disk cache support
+            launch {
+                repository.observeUserProfile(currentUserId)
+                    .catch { /* Handled safely */ }
+                    .collect { p ->
+                        if (p != null) {
+                            _currentUserProfile.value = p
+                            _userRole.value = if (p.role == UserRole.ADMIN.name) UserRole.ADMIN else UserRole.FIELD_OFFICER
+                        }
+                    }
+            }
+
+            launch {
+                repository.observeMembersWithMetadata()
+                    .catch { error ->
+                        val firestoreError = generateSequence(error) { it.cause }
+                            .filterIsInstance<FirebaseFirestoreException>()
+                            .firstOrNull()
+                        if (firestoreError == null && error is CancellationException) throw error
+                        val rootError = firestoreError ?: error
+                        if (_members.value.isEmpty()) {
+                            _membersUiState.value = UiState.Error(
+                                rootError.localizedMessage ?: "Firestore থেকে সদস্য তালিকা লোড করতে সমস্যা হয়েছে"
+                            )
+                        }
+                    }
+                    .collect { update ->
+                        val localMembers = repository.loadLocalMembers()
+                        val merged = (update.items + localMembers)
+                            .filter { it.id !in deletedDocIds }
+                            .distinctBy { it.id.ifBlank { "${it.memberSerial}_${it.name}" } }
+                            .sortedBy {
+                                it.memberSerial.filter { ch -> ch.isDigit() }.toIntOrNull() ?: Int.MAX_VALUE
+                            }
+                        _members.value = merged
+                        _membersUiState.value = UiState.Success(merged)
+                        _pendingMemberIds.value = update.pendingDocumentIds
+                        _isFromCache.value = update.isFromCache
+                        repository.saveLocalMembers(merged)
+                        launch {
+                            try {
+                                repository.cacheMembersInRoom(merged)
+                            } catch (_: Exception) {
+                            }
+                        }
+                    }
+            }
+
+            launch {
+                repository.observeSavingsWithMetadata()
+                    .catch { /* Keep current cached records if stream fails */ }
+                    .collect { update ->
+                        val localSavings = repository.loadLocalSavings()
+                        val cloudAndRoom = mergeCloudAndRoomSavings(update.items, _roomPendingTransactions.value)
+                        val merged = (cloudAndRoom + localSavings)
+                            .filter { it.id !in deletedDocIds }
+                            .distinctBy {
+                                it.id.ifBlank {
+                                    "${it.memberId}_${com.example.util.DailyAccountCalculator.normalizeDateKey(it.collectionDate)}"
+                                }
+                            }
+                        _savingsRecords.value = merged
+                        repository.saveLocalSavings(merged)
+                        _firestorePendingSavingsIds.value = update.pendingDocumentIds
+                        _isFromCache.value = update.isFromCache
+                        if (!update.hasPendingWrites && !update.isFromCache) {
+                            _lastSyncedAtMillis.value = System.currentTimeMillis()
+                        }
+                    }
+            }
+
+            launch {
+                repository.observeCollectionPeriods()
+                    .catch { }
+                    .collect { cloudPeriods ->
+                        val localPeriods = repository.loadLocalCollectionPeriods()
+                        val merged = (cloudPeriods + localPeriods)
+                            .filter { it.dateStr.isNotBlank() }
+                            .distinctBy { com.example.util.DailyAccountCalculator.normalizeDateKey(it.dateStr) }
+                        _collectionPeriods.value = merged
+                        repository.saveLocalCollectionPeriods(merged)
+                    }
+            }
+
+            launch {
+                repository.observeLoansWithMetadata()
+                    .catch { }
+                    .collect { update ->
+                        val localLoans = repository.loadLocalLoans()
+                        val merged = (update.items + localLoans)
+                            .filter { it.id !in deletedDocIds }
+                            .distinctBy { it.id }
+                        _loans.value = merged
+                        repository.saveLocalLoans(merged)
+                        _pendingLoanIds.value = update.pendingDocumentIds
+                        launch {
+                            try {
+                                repository.cacheLoansInRoom(merged)
+                            } catch (_: Exception) {
+                            }
+                        }
+                    }
+            }
+
+            launch {
+                repository.observeLoanInstallmentsWithMetadata()
+                    .catch { }
+                    .collect { update ->
+                        val localInsts = repository.loadLocalLoanInstallments()
+                        val cloudAndRoom = mergeCloudAndRoomInstallments(update.items, _roomPendingTransactions.value)
+                        val merged = (cloudAndRoom + localInsts)
+                            .filter { it.id !in deletedDocIds }
+                            .distinctBy {
+                                it.id.ifBlank {
+                                    "${it.loanId}_${com.example.util.DailyAccountCalculator.normalizeDateKey(it.installmentDate)}"
+                                }
+                            }
+                        _loanInstallments.value = merged
+                        repository.saveLocalLoanInstallments(merged)
+                        _firestorePendingInstallmentIds.value = update.pendingDocumentIds
+                    }
+            }
+
+            launch {
+                repository.observeFinesWithMetadata()
+                    .catch { }
+                    .collect { update ->
+                        val localFines = repository.loadLocalFines()
+                        val merged = (update.items + localFines)
+                            .filter { it.id !in deletedDocIds }
+                            .distinctBy { it.id }
+                        _fines.value = merged
+                        repository.saveLocalFines(merged)
+                        _pendingFineIds.value = update.pendingDocumentIds
+                    }
+            }
+
+            launch {
+                repository.observeFundLedger()
+                    .catch { }
+                    .collect { cloudLedger ->
+                        val localLedger = repository.loadLocalFundLedger()
+                        val merged = (cloudLedger + localLedger)
+                            .filter { it.id !in deletedDocIds }
+                            .distinctBy {
+                                it.id.ifBlank { "${it.date}_${it.description}_${it.moneyIn}_${it.moneyOut}" }
+                            }
+                        _fundLedger.value = merged
+                        repository.saveLocalFundLedger(merged)
+                    }
+            }
+
+            launch {
+                repository.observeAllUsers()
+                    .catch { }
+                    .collect { _allUsers.value = it }
+            }
+
+            launch {
+                repository.observeAuditLogs()
+                    .catch { }
+                    .collect { _auditLogs.value = it }
+            }
+
+            launch {
+                repository.observeAppSettings()
+                    .catch { }
+                    .collect { s ->
+                        if (s != null) {
+                            _appSettings.value = s
+                            repository.saveLocalAppSettings(s)
+                            if (s.autoUpdateEnabled) {
+                                checkForAppUpdates(force = false)
+                            }
+                        }
+                    }
+            }
+
+            launch {
+                repository.observePendingAdminNotifications()
+                    .catch { }
+                    .collect { list ->
+                        if (_userRole.value == UserRole.ADMIN) {
+                            _pendingAdminNotifications.value = list.filter { !it.isRead }
+                        }
+                    }
+            }
+        }
+    }
+
+    private fun observeRoomOfflineQueue() {
+        viewModelScope.launch {
+            repository.observePendingRoomTransactions()
+                .catch { /* Keep resilient */ }
+                .collect { pendingList ->
+                    _roomPendingTransactions.value = pendingList
+                    if (pendingList.isNotEmpty()) {
+                        _savingsRecords.value = mergeCloudAndRoomSavings(_savingsRecords.value, pendingList)
+                        _loanInstallments.value = mergeCloudAndRoomInstallments(_loanInstallments.value, pendingList)
+                    }
+                }
+        }
+    }
+
+    private fun mergeCloudAndRoomSavings(
+        cloudItems: List<SavingsRecord>,
+        roomPending: List<PendingOfflineTransactionEntity>
+    ): List<SavingsRecord> {
+        val pendingSavings = roomPending
+            .filter { it.transactionType == OfflineTransactionType.SAVINGS }
+            .map { it.toSavingsRecord() }
+        if (pendingSavings.isEmpty()) return cloudItems
+        val existingKeys = cloudItems.map { "${it.memberId}_${it.collectionDate}" }.toSet()
+        val missingFromCloud = pendingSavings.filter { rec ->
+            rec.id !in cloudItems.map { it.id } && "${rec.memberId}_${rec.collectionDate}" !in existingKeys
+        }
+        return cloudItems + missingFromCloud
+    }
+
+    private fun mergeCloudAndRoomInstallments(
+        cloudItems: List<LoanInstallment>,
+        roomPending: List<PendingOfflineTransactionEntity>
+    ): List<LoanInstallment> {
+        val pendingInsts = roomPending.filter { it.transactionType == OfflineTransactionType.LOAN_INSTALLMENT }
+        if (pendingInsts.isEmpty()) return cloudItems
+        val existingIds = cloudItems.map { it.id }.toSet()
+        val existingLoanDates = cloudItems.map { "${it.loanId}_${it.installmentDate}" }.toSet()
+        val toAdd = pendingInsts.mapIndexedNotNull { idx, tx ->
+            if (tx.id in existingIds || "${tx.loanId}_${tx.collectionDate}" in existingLoanDates) {
+                null
+            } else {
+                val serial = com.example.util.BengaliUtils.toBengaliDigits(
+                    cloudItems.count { it.loanId == tx.loanId } + idx + 1
+                )
+                tx.toLoanInstallment(serial)
+            }
+        }
+        return cloudItems + toAdd
+    }
+
+    private fun observeConnectivityChanges() {
+        viewModelScope.launch {
+            var previouslyOnline = _isOnline.value
+            repository.observeConnectivity().collect { online ->
+                _isOnline.value = online
+                if (online && !previouslyOnline) {
+                    if (repository.getCurrentUser() != null) {
+                        // Connectivity just returned — flush Room queue & Firestore persistent write queue automatically
+                        syncPendingOfflineEntries()
+                    }
+                    if (_appSettings.value.autoUpdateEnabled) {
+                        checkForAppUpdates(force = false)
+                    }
+                }
+                previouslyOnline = online
+            }
+        }
+    }
+
+    private suspend fun syncPendingOfflineEntries(): Boolean {
+        if (repository.getCurrentUser() == null) return false
+        _isSyncing.value = true
+        return try {
+            repository.syncPendingOfflineTransactions()
+            val synced = repository.waitForPendingWritesAndSync()
+            if (synced) {
+                _lastSyncedAtMillis.value = System.currentTimeMillis()
+            }
+            synced
+        } finally {
+            _isSyncing.value = false
+        }
+    }
+
+    fun triggerManualSync(onResult: (Boolean, String) -> Unit = { _, _ -> }) {
+        if (repository.getCurrentUser() == null) {
+            onResult(false, "ক্লাউড সিঙ্ক চালু করতে Google অ্যাকাউন্ট দিয়ে লগইন করুন")
+            return
+        }
+        if (!repository.isOnline()) {
+            onResult(false, "ইন্টারনেট সংযোগ নেই — আপনার ডাটা ফোনে নিরাপদে সংরক্ষিত আছে, নেট পেলে অটো সিঙ্ক হবে")
+            return
+        }
+        viewModelScope.launch {
+            val ok = syncPendingOfflineEntries()
+            if (ok) {
+                onResult(true, "সকল অফলাইন এন্ট্রি সফলভাবে ক্লাউডে সিঙ্ক হয়েছে ✓")
+            } else {
+                onResult(false, "সিঙ্ক প্রক্রিয়া চলমান — সংযোগ স্থিতিশীল হলে সম্পূর্ণ হবে")
+            }
+        }
+    }
+
+    fun refreshMembersFromFirestore() {
+        if (repository.getCurrentUser() == null) {
+            val localMembers = repository.loadLocalMembers()
+            _members.value = localMembers
+            _membersUiState.value = UiState.Success(localMembers)
+            return
+        }
+        viewModelScope.launch {
+            _membersUiState.value = UiState.Loading
+            try {
+                val fetched = repository.fetchMembersOnce()
+                _members.value = fetched
+                _membersUiState.value = UiState.Success(fetched)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _membersUiState.value = UiState.Error(
+                    e.localizedMessage ?: "Firestore থেকে সদস্য তালিকা আনা যায়নি"
+                )
+            }
+        }
+    }
+
+    // Role preview toggle allowed only when actual logged-in user is ADMIN
+    fun switchUserRole(role: UserRole) {
+        if (AuthSession.currentUserProfile?.role == UserRole.ADMIN.name) {
+            _userRole.value = role
+        }
+    }
+
+    // Member actions
+    fun suggestNextMemberSerial(currentMembers: List<Member> = _members.value): String {
+        val maxSerial = currentMembers.maxOfOrNull { m ->
+            val ascii = m.memberSerial.map { ch ->
+                when (ch) {
+                    '০' -> '0'; '১' -> '1'; '২' -> '2'; '৩' -> '3'; '৪' -> '4'
+                    '৫' -> '5'; '৬' -> '6'; '৭' -> '7'; '৮' -> '8'; '৯' -> '9'
+                    else -> ch
+                }
+            }.joinToString("")
+            ascii.filter { it.isDigit() }.toIntOrNull() ?: 0
+        } ?: 0
+        return (maxOf(maxSerial, currentMembers.size) + 1).toString()
+    }
+
+    fun registerMember(
+        member: Member,
+        onSuccess: (Member) -> Unit,
+        onError: (String) -> Unit
+    ) {
+        if (_userRole.value != UserRole.ADMIN) {
+            onError("নতুন সদস্য নিবন্ধন শুধুমাত্র অ্যাডমিন করতে পারবেন")
+            return
+        }
+        val cleanName = member.name.trim()
+        val cleanPhone = member.mobile.trim()
+        val cleanAddress = member.address.trim()
+        val cleanArea = member.area.trim().ifBlank { "যাদবপুর" }
+        val cleanSerial = member.memberSerial.trim().ifBlank { suggestNextMemberSerial() }
+        val cleanJoinDate = member.joinDate.trim().ifBlank { com.example.util.BengaliUtils.getCurrentDateStr() }
+
+        if (cleanName.isBlank()) {
+            onError("অনুগ্রহ করে সদস্যের নাম লিখুন")
+            return
+        }
+        if (cleanPhone.isBlank() || cleanPhone.filter { it.isDigit() }.length < 6) {
+            onError("অনুগ্রহ করে সঠিক মোবাইল নম্বর লিখুন")
+            return
+        }
+        if (cleanAddress.isBlank()) {
+            onError("অনুগ্রহ করে সদস্যের ঠিকানা লিখুন")
+            return
+        }
+        val normalizedSerialDigits = cleanSerial.filter { it.isDigit() }
+        val serialExists = _members.value.any { existing ->
+            existing.memberSerial.trim().equals(cleanSerial, ignoreCase = true) ||
+                (normalizedSerialDigits.isNotBlank() && existing.memberSerial.filter { it.isDigit() } == normalizedSerialDigits)
+        }
+        if (serialExists) {
+            onError("ক্রমিক নং '$cleanSerial' ইতিমধ্যেই নিবন্ধিত আছে। অন্য ক্রমিক নং দিন।")
+            return
+        }
+
+        val generatedId = member.id.ifBlank { "mem_${System.currentTimeMillis()}" }
+        val newMember = member.copy(
+            id = generatedId,
+            memberSerial = cleanSerial,
+            name = cleanName,
+            mobile = cleanPhone,
+            address = cleanAddress,
+            area = cleanArea,
+            joinDate = cleanJoinDate,
+            weeklySavingsAmount = if (member.weeklySavingsAmount > 0.0) member.weeklySavingsAmount else 100.0,
+            createdBy = currentUserId
+        )
+
+        viewModelScope.launch {
+            _isSavingMember.value = true
+            try {
+                if (repository.getCurrentUser() != null) {
+                    repository.addMember(newMember)
+                }
+                val updated = (_members.value + newMember)
+                    .distinctBy { it.id }
+                    .sortedBy {
+                        it.memberSerial.filter { ch -> ch.isDigit() }.toIntOrNull() ?: Int.MAX_VALUE
+                    }
+                _members.value = updated
+                _membersUiState.value = UiState.Success(updated)
+                repository.saveLocalMembers(updated)
+                if (repository.getCurrentUser() != null) {
+                    try {
+                        repository.cacheMembersInRoom(updated)
+                    } catch (_: Exception) {
+                    }
+                }
+                onSuccess(newMember)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                onError(e.localizedMessage ?: "Firestore-এ সদস্য নিবন্ধন সংরক্ষণ করতে সমস্যা হয়েছে")
+            } finally {
+                _isSavingMember.value = false
+            }
+        }
+    }
+
+    fun addMember(member: Member, onSuccess: () -> Unit, onError: (String) -> Unit) {
+        val resolvedSerial = member.memberSerial.trim().ifBlank { suggestNextMemberSerial() }
+        val resolvedJoinDate = member.joinDate.trim().ifBlank { com.example.util.BengaliUtils.getCurrentDateStr() }
+        val newMember = member.copy(
+            id = member.id.ifBlank { "mem_${System.currentTimeMillis()}" },
+            memberSerial = resolvedSerial,
+            name = member.name.trim(),
+            area = member.area.trim().ifBlank { "যাদবপুর উত্তর" },
+            joinDate = resolvedJoinDate,
+            weeklySavingsAmount = if (member.weeklySavingsAmount > 0.0) member.weeklySavingsAmount else 100.0,
+            createdBy = member.createdBy.ifBlank { currentUserId }
+        )
+        val updated = (_members.value + newMember)
+            .distinctBy { it.id }
+            .sortedBy {
+                it.memberSerial.filter { ch -> ch.isDigit() }.toIntOrNull() ?: Int.MAX_VALUE
+            }
+        _members.value = updated
+        _membersUiState.value = UiState.Success(updated)
+        repository.saveLocalMembers(updated)
+        onSuccess()
+        viewModelScope.launch {
+            try {
+                if (repository.getCurrentUser() != null) {
+                    repository.addMember(newMember)
+                }
+            } catch (_: Exception) {
+                // Non-blocking
+            }
+        }
+    }
+
+    fun updateMember(member: Member, onSuccess: () -> Unit, onError: (String) -> Unit) {
+        if (_userRole.value != UserRole.ADMIN) {
+            onError("সদস্যের তথ্য সংশোধন শুধুমাত্র অ্যাডমিন করতে পারবেন")
+            return
+        }
+        val updated = _members.value.map { if (it.id == member.id) member else it }
+        _members.value = updated
+        _membersUiState.value = UiState.Success(updated)
+        repository.saveLocalMembers(updated)
+        onSuccess()
+        viewModelScope.launch {
+            try {
+                if (repository.getCurrentUser() != null) {
+                    repository.cacheMembersInRoom(updated)
+                    repository.updateMember(member)
+                }
+            } catch (_: Exception) {
+                // Non-blocking
+            }
+        }
+    }
+
+    // Savings actions with instant optimistic local update + missed-week double catch-up + 10 BDT fine
+    fun recordSavings(
+        member: Member,
+        collectionDate: String,
+        amount: Double,
+        onSuccess: () -> Unit,
+        onError: (String) -> Unit
+    ) {
+        val normalizedDate = com.example.util.DailyAccountCalculator.normalizeDateKey(collectionDate)
+            .ifBlank { collectionDate.trim() }
+        val isOfficer = _userRole.value == UserRole.FIELD_OFFICER
+        val existingInSameWeek = _savingsRecords.value.firstOrNull {
+            (it.memberId == member.id || it.memberName == member.name) &&
+                it.status != TransactionStatus.REJECTED.name &&
+                (com.example.util.DailyAccountCalculator.normalizeDateKey(it.collectionDate) == normalizedDate ||
+                    com.example.util.SavingsAndFineCalculator.isSameWeek(it.collectionDate, normalizedDate))
+        }
+        if (existingInSameWeek != null) {
+            onError("${member.name}-এর সঞ্চয় এই তারিখে/সপ্তাহে (${existingInSameWeek.collectionDate}) ইতিমধ্যেই সাবমিট করা হয়েছে। এক তারিখে দুইবার সাবমিট করা যাবে না।")
+            return
+        }
+        val officerName = _currentUserProfile.value?.displayName ?: if (isOfficer) "মাঠ কর্মকর্তা" else "অ্যাডমিন"
+        val status = if (isOfficer) TransactionStatus.PENDING.name else TransactionStatus.APPROVED.name
+
+        val orderedDates = com.example.util.SavingsAndFineCalculator.sortDateStrings(
+            _collectionPeriods.value.map { it.dateStr } +
+                _savingsRecords.value.map { it.collectionDate } +
+                listOf(normalizedDate)
+        )
+
+        val allocationResult = if (isOfficer) {
+            // Field Officers can only CREATE new entries for collectionDate; Admin handles catch-up splitting on approval
+            com.example.util.SavingsAllocationResult(
+                allocations = listOf(
+                    com.example.util.DateSavingsAllocation(
+                        collectionDate = normalizedDate,
+                        newTotalAmount = amount,
+                        addedDelta = amount,
+                        isCatchUpForMissedWeek = false
+                    )
+                ),
+                catchUpDates = emptyList()
+            )
+        } else {
+            com.example.util.SavingsAndFineCalculator.allocateSavingsPayment(
+                member = member,
+                targetDate = normalizedDate,
+                enteredAmount = amount,
+                orderedDates = orderedDates,
+                existingRecords = _savingsRecords.value
+            )
+        }
+
+        val currentList = _savingsRecords.value.toMutableList()
+        val recordsToWrite = mutableListOf<SavingsRecord>()
+        var netNewCash = 0.0
+
+        for (alloc in allocationResult.allocations) {
+            val recordId = "${member.id}_${alloc.collectionDate.replace("/", "-")}"
+            val updatedRecord = SavingsRecord(
+                id = recordId,
+                memberId = member.id,
+                memberName = member.name,
+                memberSerial = member.memberSerial,
+                collectionDate = alloc.collectionDate,
+                amount = alloc.newTotalAmount,
+                isPaid = alloc.newTotalAmount > 0.0,
+                officerId = currentUserId,
+                officerName = officerName,
+                status = status,
+                createdBy = currentUserId,
+                approvedBy = if (status == TransactionStatus.APPROVED.name) currentUserId else ""
+            )
+            val index = currentList.indexOfFirst {
+                (it.memberId == member.id || it.memberName == member.name) && it.collectionDate == alloc.collectionDate
+            }
+            if (index >= 0) {
+                currentList[index] = updatedRecord
+            } else {
+                currentList.add(updatedRecord)
+            }
+            recordsToWrite.add(updatedRecord)
+            netNewCash += alloc.addedDelta
+        }
+        _savingsRecords.value = currentList
+        repository.saveLocalSavings(currentList)
+
+        val generatedFines = mutableListOf<FineRecord>()
+        if (amount <= 0.0) {
+            val appliedDate = com.example.util.SavingsAndFineCalculator.resolveFineAppliedDate(normalizedDate, orderedDates)
+            val fine = com.example.util.SavingsAndFineCalculator.buildSavingsFineRecord(
+                member = member,
+                missedDate = normalizedDate,
+                appliedDate = appliedDate,
+                officerId = currentUserId,
+                officerName = officerName
+            )
+            if (_fines.value.none { it.id == fine.id }) {
+                generatedFines.add(fine)
+            }
+        }
+        for (missedPrev in allocationResult.catchUpDates) {
+            val appliedDate = com.example.util.SavingsAndFineCalculator.resolveFineAppliedDate(missedPrev, orderedDates)
+            val fine = com.example.util.SavingsAndFineCalculator.buildSavingsFineRecord(
+                member = member,
+                missedDate = missedPrev,
+                appliedDate = appliedDate,
+                officerId = currentUserId,
+                officerName = officerName
+            )
+            if (_fines.value.none { it.id == fine.id } && generatedFines.none { it.id == fine.id }) {
+                generatedFines.add(fine)
+            }
+        }
+        mergeGeneratedFinesLocally(generatedFines)
+
+        if (status == TransactionStatus.APPROVED.name && netNewCash > 0.0) {
+            val prevBalance = _fundLedger.value.lastOrNull()?.balance ?: 0.0
+            val descSuffix = if (allocationResult.catchUpDates.isNotEmpty()) {
+                " [বকেয়া সহ]"
+            } else ""
+            val recordRefId = "${member.id}_${normalizedDate.replace("/", "-")}"
+            val newLedger = _fundLedger.value + FundLedgerEntry(
+                id = "ledger_$recordRefId",
+                date = normalizedDate,
+                description = "$normalizedDate সঞ্চয় (${member.name})$descSuffix",
+                moneyIn = netNewCash,
+                moneyOut = 0.0,
+                balance = prevBalance + netNewCash,
+                referenceId = recordRefId,
+                type = LedgerType.SAVINGS_COLLECTION.name,
+                createdBy = currentUserId
+            )
+            _fundLedger.value = newLedger
+            repository.saveLocalFundLedger(newLedger)
+        }
+
+        if (repository.getCurrentUser() == null) {
+            if (isOfficer) {
+                notifyAdminOfOfficerSubmission(
+                    title = "নতুন সঞ্চয় অনুমোদনের অনুরোধ",
+                    body = "$officerName সদস্য ${member.name}-এর $normalizedDate তারিখের ৳${amount.toInt()} সঞ্চয় জমা পাঠিয়েছেন।",
+                    transactionType = "SAVINGS",
+                    transactionId = "${member.id}_${normalizedDate.replace("/", "-")}",
+                    memberName = member.name,
+                    amount = amount,
+                    officerName = officerName
+                )
+            }
+            onSuccess()
+            return
+        }
+
+        viewModelScope.launch {
+            try {
+                // Persist in Room first to guarantee zero data loss and prevent same-week duplicates
+                val enqueuedRecords = repository.enqueueOfflineSavingsBatch(recordsToWrite, isOfficer)
+                if (enqueuedRecords.isEmpty()) {
+                    onError("এই সদস্যের সঞ্চয় অফলাইন বা অনলাইনে ইতিমধ্যেই এই সপ্তাহে জমা করা হয়েছে।")
+                    return@launch
+                }
+                onSuccess()
+                if (repository.isOnline()) {
+                    repository.recordSavingsBatchEntries(
+                        primaryDate = normalizedDate,
+                        recordsToWrite = enqueuedRecords,
+                        netNewCashCollected = netNewCash,
+                        isOfficer = isOfficer
+                    )
+                    if (generatedFines.isNotEmpty()) {
+                        repository.upsertFinesBatch(generatedFines)
+                    }
+                    if (isOfficer) {
+                        notifyAdminOfOfficerSubmission(
+                            title = "নতুন সঞ্চয় অনুমোদনের অনুরোধ",
+                            body = "$officerName সদস্য ${member.name}-এর $normalizedDate তারিখের ৳${amount.toInt()} সঞ্চয় জমা পাঠিয়েছেন।",
+                            transactionType = "SAVINGS",
+                            transactionId = "${member.id}_${normalizedDate.replace("/", "-")}",
+                            memberName = member.name,
+                            amount = amount,
+                            officerName = officerName
+                        )
+                    }
+                    enqueuedRecords.forEach { repository.markRoomTransactionSynced(it.id) }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                onError(e.localizedMessage ?: "সঞ্চয় সংরক্ষণে সমস্যা হয়েছে")
+            }
+        }
+    }
+
+    fun submitWeeklySavingsBatch(
+        collectionDate: String,
+        memberAmounts: Map<String, Double>,
+        onSuccess: (paidCount: Int, totalAmount: Double) -> Unit,
+        onError: (String) -> Unit,
+        onDetails: (catchUpCount: Int, finesGenerated: Int) -> Unit = { _, _ -> }
+    ) {
+        val currentMembers = _members.value
+        val entries = currentMembers.mapNotNull { member ->
+            val amt = memberAmounts[member.id] ?: return@mapNotNull null
+            member to amt
+        }
+        if (entries.isEmpty()) {
+            onError("কোনো সদস্যের সঞ্চয় এন্ট্রি পাওয়া যায়নি")
+            return
+        }
+
+        val normalizedDate = com.example.util.DailyAccountCalculator.normalizeDateKey(collectionDate)
+            .ifBlank { collectionDate.trim() }
+        val isOfficer = _userRole.value == UserRole.FIELD_OFFICER
+        // Enforce once-per-date/week rule: exclude members who already have a non-rejected record on this date or week
+        val filteredEntries = entries.filter { (member, _) ->
+            _savingsRecords.value.none {
+                (it.memberId == member.id || it.memberName == member.name) &&
+                    it.status != TransactionStatus.REJECTED.name &&
+                    (com.example.util.DailyAccountCalculator.normalizeDateKey(it.collectionDate) == normalizedDate ||
+                        com.example.util.SavingsAndFineCalculator.isSameWeek(it.collectionDate, normalizedDate))
+            }
+        }
+
+        if (filteredEntries.isEmpty()) {
+            onError("এই তারিখে ($normalizedDate) ইতিমধ্যেই সঞ্চয় সাবমিট করা হয়েছে। এক তারিখে দুইবার সাবমিট করা যাবে না।")
+            return
+        }
+
+        val officerName = _currentUserProfile.value?.displayName ?: "অ্যাডমিন"
+        val status = if (isOfficer) TransactionStatus.PENDING.name else TransactionStatus.APPROVED.name
+
+        val orderedDates = com.example.util.SavingsAndFineCalculator.sortDateStrings(
+            _collectionPeriods.value.map { it.dateStr } +
+                _savingsRecords.value.map { it.collectionDate } +
+                listOf(collectionDate)
+        )
+
+        val updatedList = _savingsRecords.value.toMutableList()
+        val recordsToWrite = mutableListOf<SavingsRecord>()
+        val generatedFines = mutableListOf<FineRecord>()
+        var catchUpCount = 0
+        var netNewCashTotal = 0.0
+
+        for ((member, enteredAmt) in filteredEntries) {
+            val missedBefore = com.example.util.SavingsAndFineCalculator.findMissedEarlierSavingsDates(
+                member = member,
+                targetDate = collectionDate,
+                orderedDates = orderedDates,
+                existingRecords = updatedList
+            )
+
+            val allocationResult = if (isOfficer) {
+                // Officers only create new pending entries; Admin allocates catch-up upon approval
+                com.example.util.SavingsAllocationResult(
+                    allocations = listOf(
+                        com.example.util.DateSavingsAllocation(
+                            collectionDate = collectionDate,
+                            newTotalAmount = enteredAmt,
+                            addedDelta = enteredAmt,
+                            isCatchUpForMissedWeek = false
+                        )
+                    ),
+                    catchUpDates = emptyList()
+                )
+            } else {
+                com.example.util.SavingsAndFineCalculator.allocateSavingsPayment(
+                    member = member,
+                    targetDate = collectionDate,
+                    enteredAmount = enteredAmt,
+                    orderedDates = orderedDates,
+                    existingRecords = updatedList
+                )
+            }
+
+            if (allocationResult.catchUpDates.isNotEmpty()) {
+                catchUpCount += allocationResult.catchUpDates.size
+            }
+
+            for (alloc in allocationResult.allocations) {
+                val recordId = "${member.id}_${alloc.collectionDate.replace("/", "-")}"
+                val rec = SavingsRecord(
+                    id = recordId,
+                    memberId = member.id,
+                    memberName = member.name,
+                    memberSerial = member.memberSerial,
+                    collectionDate = alloc.collectionDate,
+                    amount = alloc.newTotalAmount,
+                    isPaid = alloc.newTotalAmount > 0.0,
+                    officerId = currentUserId,
+                    officerName = officerName,
+                    status = status,
+                    createdBy = currentUserId,
+                    approvedBy = if (status == TransactionStatus.APPROVED.name) currentUserId else ""
+                )
+                val idx = updatedList.indexOfFirst {
+                    (it.memberId == member.id || it.memberName == member.name) && it.collectionDate == alloc.collectionDate
+                }
+                if (idx >= 0) {
+                    updatedList[idx] = rec
+                } else {
+                    updatedList.add(rec)
+                }
+                recordsToWrite.add(rec)
+                netNewCashTotal += alloc.addedDelta
+            }
+
+            // Generate 10 BDT fine if current week is missed (0.0)
+            if (enteredAmt <= 0.0) {
+                val appliedDate = com.example.util.SavingsAndFineCalculator.resolveFineAppliedDate(collectionDate, orderedDates)
+                val fine = com.example.util.SavingsAndFineCalculator.buildSavingsFineRecord(
+                    member = member,
+                    missedDate = collectionDate,
+                    appliedDate = appliedDate,
+                    officerId = currentUserId,
+                    officerName = officerName
+                )
+                if (_fines.value.none { it.id == fine.id } && generatedFines.none { it.id == fine.id }) {
+                    generatedFines.add(fine)
+                }
+            }
+
+            // Also ensure 10 BDT fine exists for any earlier missed week(s) still unpaid/just caught up
+            for (missedPrev in missedBefore) {
+                val appliedDate = com.example.util.SavingsAndFineCalculator.resolveFineAppliedDate(missedPrev, orderedDates)
+                val fine = com.example.util.SavingsAndFineCalculator.buildSavingsFineRecord(
+                    member = member,
+                    missedDate = missedPrev,
+                    appliedDate = appliedDate,
+                    officerId = currentUserId,
+                    officerName = officerName
+                )
+                if (_fines.value.none { it.id == fine.id } && generatedFines.none { it.id == fine.id }) {
+                    generatedFines.add(fine)
+                }
+            }
+        }
+        _savingsRecords.value = updatedList
+        repository.saveLocalSavings(updatedList)
+        mergeGeneratedFinesLocally(generatedFines)
+
+        val paidCount = filteredEntries.count { it.second > 0.0 }
+        val totalEnteredAmount = filteredEntries.sumOf { it.second }
+
+        if (status == TransactionStatus.APPROVED.name && netNewCashTotal > 0.0) {
+            val prevBalance = _fundLedger.value.lastOrNull()?.balance ?: 0.0
+            val cleanRef = normalizedDate.replace("/", "-")
+            val ledgerId = if (recordsToWrite.size == 1) "ledger_${recordsToWrite.first().id}" else "ledger_batch_$cleanRef"
+            val newLedger = _fundLedger.value + FundLedgerEntry(
+                id = ledgerId,
+                date = normalizedDate,
+                description = "$normalizedDate সাপ্তাহিক সঞ্চয় আদায় (${paidCount} জন)",
+                moneyIn = netNewCashTotal,
+                moneyOut = 0.0,
+                balance = prevBalance + netNewCashTotal,
+                referenceId = cleanRef,
+                type = LedgerType.SAVINGS_COLLECTION.name,
+                createdBy = currentUserId
+            )
+            _fundLedger.value = newLedger
+            repository.saveLocalFundLedger(newLedger)
+        }
+
+        if (repository.getCurrentUser() == null) {
+            if (isOfficer) {
+                notifyAdminOfOfficerSubmission(
+                    title = "নতুন সাপ্তাহিক সঞ্চয় অনুমোদনের অনুরোধ",
+                    body = "$officerName $normalizedDate তারিখে ${paidCount} জন সদস্যের মোট ৳${totalEnteredAmount.toInt()} সঞ্চয় জমা পাঠিয়েছেন।",
+                    transactionType = "SAVINGS_BATCH",
+                    transactionId = normalizedDate.replace("/", "-"),
+                    memberName = "${paidCount} জন সদস্য",
+                    amount = totalEnteredAmount,
+                    officerName = officerName
+                )
+            }
+            onDetails(catchUpCount, generatedFines.size)
+            onSuccess(paidCount, totalEnteredAmount)
+            return
+        }
+
+        viewModelScope.launch {
+            _isSavingBatch.value = true
+            try {
+                val enqueuedRecords = repository.enqueueOfflineSavingsBatch(recordsToWrite, isOfficer)
+                if (enqueuedRecords.isEmpty()) {
+                    onError("এই সপ্তাহে ($collectionDate) ইতিমধ্যেই সকল সদস্যের সঞ্চয় জমা রয়েছে।")
+                    return@launch
+                }
+                if (repository.isOnline()) {
+                    repository.recordSavingsBatchEntries(
+                        primaryDate = collectionDate,
+                        recordsToWrite = enqueuedRecords,
+                        netNewCashCollected = netNewCashTotal,
+                        isOfficer = isOfficer
+                    )
+                    if (generatedFines.isNotEmpty()) {
+                        repository.upsertFinesBatch(generatedFines)
+                    }
+                    if (isOfficer) {
+                        notifyAdminOfOfficerSubmission(
+                            title = "নতুন সাপ্তাহিক সঞ্চয় অনুমোদনের অনুরোধ",
+                            body = "$officerName $collectionDate তারিখে ${paidCount} জন সদস্যের মোট ৳${totalEnteredAmount.toInt()} সঞ্চয় জমা পাঠিয়েছেন।",
+                            transactionType = "SAVINGS_BATCH",
+                            transactionId = collectionDate.replace("/", "-"),
+                            memberName = "${paidCount} জন সদস্য",
+                            amount = totalEnteredAmount,
+                            officerName = officerName
+                        )
+                    }
+                    enqueuedRecords.forEach { repository.markRoomTransactionSynced(it.id) }
+                }
+                onDetails(catchUpCount, generatedFines.size)
+                onSuccess(paidCount, totalEnteredAmount)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                onError(e.localizedMessage ?: "Firestore-এ সঞ্চয় সংরক্ষণ ব্যর্থ হয়েছে")
+            } finally {
+                _isSavingBatch.value = false
+            }
+        }
+    }
+
+    private fun mergeGeneratedFinesLocally(newFines: List<FineRecord>) {
+        if (newFines.isEmpty()) return
+        val merged = _fines.value.toMutableList()
+        for (fine in newFines) {
+            if (merged.none { it.id == fine.id }) {
+                merged.add(fine)
+            }
+        }
+        _fines.value = merged
+        repository.saveLocalFines(merged)
+    }
+
+    fun approveSavings(record: SavingsRecord, onSuccess: () -> Unit, onError: (String) -> Unit) {
+        if (_userRole.value != UserRole.ADMIN) {
+            onError("অনুমোদন শুধুমাত্র অ্যাডমিন করতে পারবেন")
+            return
+        }
+        val member = _members.value.firstOrNull { it.id == record.memberId || it.name == record.memberName }
+        val orderedDates = com.example.util.SavingsAndFineCalculator.sortDateStrings(
+            _collectionPeriods.value.map { it.dateStr } +
+                _savingsRecords.value.map { it.collectionDate } +
+                listOf(record.collectionDate)
+        )
+        val allocationResult = if (member != null && record.amount > member.weeklySavingsAmount) {
+            com.example.util.SavingsAndFineCalculator.allocateSavingsPayment(
+                member = member,
+                targetDate = record.collectionDate,
+                enteredAmount = record.amount,
+                orderedDates = orderedDates,
+                existingRecords = _savingsRecords.value
+            )
+        } else null
+
+        val updated = _savingsRecords.value.toMutableList()
+        if (allocationResult != null && allocationResult.catchUpDates.isNotEmpty() && member != null) {
+            for (alloc in allocationResult.allocations) {
+                val recId = "${member.id}_${alloc.collectionDate.replace("/", "-")}"
+                val newRec = record.copy(
+                    id = recId,
+                    collectionDate = alloc.collectionDate,
+                    amount = alloc.newTotalAmount,
+                    isPaid = alloc.newTotalAmount > 0.0,
+                    status = TransactionStatus.APPROVED.name,
+                    approvedBy = currentUserId
+                )
+                val idx = updated.indexOfFirst { it.id == recId || (it.memberId == member.id && it.collectionDate == alloc.collectionDate) }
+                if (idx >= 0) updated[idx] = newRec else updated.add(newRec)
+            }
+        } else {
+            for (i in updated.indices) {
+                if (updated[i].id == record.id) {
+                    updated[i] = updated[i].copy(status = TransactionStatus.APPROVED.name, approvedBy = currentUserId)
+                }
+            }
+        }
+        _savingsRecords.value = updated
+        repository.saveLocalSavings(updated)
+        if (record.amount > 0.0) {
+            val prevBalance = _fundLedger.value.lastOrNull()?.balance ?: 0.0
+            val newLedger = _fundLedger.value + FundLedgerEntry(
+                id = "ledger_app_${record.id}",
+                date = record.collectionDate,
+                description = "${record.collectionDate} সঞ্চয় (${record.memberName})",
+                moneyIn = record.amount,
+                moneyOut = 0.0,
+                balance = prevBalance + record.amount,
+                referenceId = record.id,
+                type = LedgerType.SAVINGS_COLLECTION.name,
+                createdBy = currentUserId
+            )
+            _fundLedger.value = newLedger
+            repository.saveLocalFundLedger(newLedger)
+        }
+
+        if (repository.getCurrentUser() == null) {
+            onSuccess()
+            return
+        }
+        viewModelScope.launch {
+            try {
+                if (allocationResult != null && allocationResult.catchUpDates.isNotEmpty() && member != null) {
+                    val recordsToWrite = allocationResult.allocations.map { alloc ->
+                        record.copy(
+                            id = "${member.id}_${alloc.collectionDate.replace("/", "-")}",
+                            collectionDate = alloc.collectionDate,
+                            amount = alloc.newTotalAmount,
+                            isPaid = alloc.newTotalAmount > 0.0,
+                            status = TransactionStatus.APPROVED.name,
+                            approvedBy = currentUserId
+                        )
+                    }
+                    repository.recordSavingsBatchEntries(
+                        primaryDate = record.collectionDate,
+                        recordsToWrite = recordsToWrite,
+                        netNewCashCollected = record.amount,
+                        isOfficer = false
+                    )
+                } else {
+                    repository.approveSavings(record)
+                }
+                onSuccess()
+            } catch (e: Exception) {
+                onError(e.message ?: "অনুমোদন করতে সমস্যা হয়েছে")
+            }
+        }
+    }
+
+    fun rejectSavings(record: SavingsRecord, onSuccess: () -> Unit, onError: (String) -> Unit) {
+        if (_userRole.value != UserRole.ADMIN) {
+            onError("প্রত্যাখ্যান শুধুমাত্র অ্যাডমিন করতে পারবেন")
+            return
+        }
+        val updated = _savingsRecords.value.map {
+            if (it.id == record.id) {
+                it.copy(status = TransactionStatus.REJECTED.name, approvedBy = currentUserId)
+            } else it
+        }
+        _savingsRecords.value = updated
+        repository.saveLocalSavings(updated)
+
+        if (repository.getCurrentUser() == null) {
+            onSuccess()
+            return
+        }
+        viewModelScope.launch {
+            try {
+                repository.rejectSavings(record)
+                onSuccess()
+            } catch (e: Exception) {
+                onError(e.message ?: "প্রত্যাখ্যান করতে ব্যর্থ")
+            }
+        }
+    }
+
+    fun addCollectionDate(dateStr: String, monthYear: String, onSuccess: () -> Unit, onError: (String) -> Unit) {
+        if (_userRole.value != UserRole.ADMIN) {
+            onError("নতুন কালেকশন তারিখ শুধুমাত্র অ্যাডমিন যোগ করতে পারবেন")
+            return
+        }
+        if (com.example.util.SavingsAndFineCalculator.parseDateMillis(dateStr) == null) {
+            onError("সঠিক তারিখ দিন (যেমন: 11/11/26)")
+            return
+        }
+        val cleanDate = com.example.util.DailyAccountCalculator.normalizeDateKey(dateStr)
+        val newPeriod = CollectionPeriod(
+            id = "period_${cleanDate.replace("/", "-")}",
+            dateStr = cleanDate,
+            monthYear = monthYear,
+            isClosed = false,
+            totalSavings = 0.0
+        )
+        if (_collectionPeriods.value.none {
+                com.example.util.DailyAccountCalculator.normalizeDateKey(it.dateStr) == cleanDate
+            }
+        ) {
+            val updated = _collectionPeriods.value + newPeriod
+            _collectionPeriods.value = updated
+            repository.saveLocalCollectionPeriods(updated)
+        }
+        _selectedSavingsDate.value = cleanDate
+        repository.saveSelectedSavingsDate(cleanDate)
+        onSuccess()
+        viewModelScope.launch {
+            try {
+                if (repository.getCurrentUser() != null) {
+                    repository.addCollectionPeriod(cleanDate, monthYear)
+                }
+            } catch (e: Exception) {
+                onError(e.message ?: "তারিখ যোগ করতে সমস্যা হয়েছে")
+            }
+        }
+    }
+
+    fun updateCollectionDate(
+        oldDate: String,
+        newDate: String,
+        monthYear: String,
+        onSuccess: () -> Unit,
+        onError: (String) -> Unit
+    ) {
+        if (_userRole.value != UserRole.ADMIN) {
+            onError("তারিখ আপডেট শুধুমাত্র অ্যাডমিন করতে পারবেন")
+            return
+        }
+        if (newDate.isBlank() || com.example.util.SavingsAndFineCalculator.parseDateMillis(newDate) == null) {
+            onError("সঠিক তারিখ দিন (যেমন: 14/11/26)")
+            return
+        }
+        val cleanOld = com.example.util.DailyAccountCalculator.normalizeDateKey(oldDate)
+        val cleanNew = com.example.util.DailyAccountCalculator.normalizeDateKey(newDate)
+        if (cleanOld == cleanNew) {
+            onSuccess()
+            return
+        }
+        val existingDates = (_collectionPeriods.value.map {
+            com.example.util.DailyAccountCalculator.normalizeDateKey(it.dateStr)
+        } + _savingsRecords.value.map {
+            com.example.util.DailyAccountCalculator.normalizeDateKey(it.collectionDate)
+        }).distinct()
+        if (cleanNew in existingDates) {
+            onError("এই তারিখটি ($cleanNew) ইতিমধ্যেই শিটে রয়েছে")
+            return
+        }
+
+        val updatedPeriods = if (_collectionPeriods.value.any {
+                com.example.util.DailyAccountCalculator.normalizeDateKey(it.dateStr) == cleanOld
+            }
+        ) {
+            _collectionPeriods.value.map {
+                if (com.example.util.DailyAccountCalculator.normalizeDateKey(it.dateStr) == cleanOld) {
+                    it.copy(dateStr = cleanNew)
+                } else it
+            }
+        } else {
+            _collectionPeriods.value + CollectionPeriod(
+                id = "period_${cleanNew.replace("/", "-")}",
+                dateStr = cleanNew,
+                monthYear = monthYear,
+                isClosed = false,
+                totalSavings = 0.0
+            )
+        }
+
+        val oldIdsToDelete = mutableListOf<String>()
+        val changedSavings = mutableListOf<SavingsRecord>()
+        val updatedSavings = _savingsRecords.value.map { rec ->
+            if (com.example.util.DailyAccountCalculator.normalizeDateKey(rec.collectionDate) == cleanOld) {
+                val newId = "${rec.memberId}_${cleanNew.replace("/", "-")}"
+                if (rec.id.isNotBlank() && rec.id != newId) {
+                    oldIdsToDelete.add(rec.id)
+                }
+                val updated = rec.copy(id = newId, collectionDate = cleanNew)
+                changedSavings.add(updated)
+                updated
+            } else rec
+        }
+
+        val changedFines = mutableListOf<FineRecord>()
+        val updatedFines = _fines.value.map { fine ->
+            val normMissed = com.example.util.DailyAccountCalculator.normalizeDateKey(fine.missedDate)
+            val normFine = com.example.util.DailyAccountCalculator.normalizeDateKey(fine.fineDate)
+            if (normMissed == cleanOld || normFine == cleanOld || fine.missedDate == cleanOld || fine.fineDate == cleanOld) {
+                val updated = fine.copy(
+                    missedDate = if (normMissed == cleanOld || fine.missedDate == cleanOld) cleanNew else fine.missedDate,
+                    fineDate = if (normFine == cleanOld || fine.fineDate == cleanOld) cleanNew else fine.fineDate,
+                    referenceId = if (fine.referenceId == cleanOld) cleanNew else fine.referenceId
+                )
+                changedFines.add(updated)
+                updated
+            } else fine
+        }
+
+        val changedLedger = mutableListOf<FundLedgerEntry>()
+        val updatedLedger = _fundLedger.value.map { entry ->
+            if (entry.type == LedgerType.SAVINGS_COLLECTION.name && entry.date == cleanOld) {
+                val updatedDesc = if (entry.description.startsWith(cleanOld)) {
+                    entry.description.replaceFirst(cleanOld, cleanNew)
+                } else entry.description
+                val updated = entry.copy(date = cleanNew, description = updatedDesc)
+                changedLedger.add(updated)
+                updated
+            } else entry
+        }
+
+        val updatedInstallments = _loanInstallments.value.map { inst ->
+            if (com.example.util.DailyAccountCalculator.normalizeDateKey(inst.installmentDate) == cleanOld) {
+                val newId = "inst_${inst.loanId}_${cleanNew.replace("/", "-")}"
+                inst.copy(id = newId, installmentDate = cleanNew)
+            } else inst
+        }
+
+        _collectionPeriods.value = updatedPeriods
+        _savingsRecords.value = updatedSavings
+        _loanInstallments.value = updatedInstallments
+        _fines.value = updatedFines
+        _fundLedger.value = updatedLedger
+        if (com.example.util.DailyAccountCalculator.normalizeDateKey(_selectedSavingsDate.value) == cleanOld) {
+            _selectedSavingsDate.value = cleanNew
+            repository.saveSelectedSavingsDate(cleanNew)
+        }
+        if (com.example.util.DailyAccountCalculator.normalizeDateKey(_selectedLoanDate.value) == cleanOld) {
+            _selectedLoanDate.value = cleanNew
+            repository.saveSelectedLoanDate(cleanNew)
+        }
+        if (com.example.util.DailyAccountCalculator.normalizeDateKey(_selectedFineDate.value) == cleanOld) {
+            _selectedFineDate.value = cleanNew
+            repository.saveSelectedFineDate(cleanNew)
+        }
+
+        // Always persist locally in both local & cloud modes so updated dates survive restarts/offline
+        repository.saveLocalCollectionPeriods(updatedPeriods)
+        repository.saveLocalSavings(updatedSavings)
+        repository.saveLocalLoanInstallments(updatedInstallments)
+        repository.saveLocalFines(updatedFines)
+        repository.saveLocalFundLedger(updatedLedger)
+
+        if (repository.getCurrentUser() == null) {
+            onSuccess()
+            return
+        }
+
+        viewModelScope.launch {
+            try {
+                repository.updateCollectionPeriodDate(
+                    oldDate = cleanOld,
+                    newDate = cleanNew,
+                    monthYear = monthYear,
+                    updatedRecords = changedSavings,
+                    oldRecordIdsToDelete = oldIdsToDelete,
+                    updatedFines = changedFines,
+                    updatedLedgerEntries = changedLedger
+                )
+                onSuccess()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                onError(e.localizedMessage ?: "তারিখ আপডেট করতে সমস্যা হয়েছে")
+            }
+        }
+    }
+
+    // Loans actions
+    fun createLoan(
+        loan: Loan,
+        alsoAddMember: Member? = null,
+        onSuccess: () -> Unit,
+        onError: (String) -> Unit
+    ) {
+        if (_userRole.value != UserRole.ADMIN) {
+            onError("শুধুমাত্র অ্যাডমিন নতুন ঋণ বিতরণ করতে পারবেন")
+            return
+        }
+        if (loan.memberName.isBlank()) {
+            onError("অনুগ্রহ করে সদস্যের নাম নির্বাচন বা লিখুন")
+            return
+        }
+        if (loan.principal <= 0.0) {
+            onError("মূল ঋণের পরিমাণ শূন্যের বেশি হতে হবে")
+            return
+        }
+        if (loan.interest < 0.0) {
+            onError("সুদের পরিমাণ ঋণাত্মক হতে পারবে না")
+            return
+        }
+        if (loan.weeklyInstallment <= 0.0) {
+            onError("সাপ্তাহিক কিস্তির পরিমাণ শূন্যের বেশি হতে হবে")
+            return
+        }
+        if (loan.loanDate.isBlank()) {
+            onError("ঋণের তারিখ প্রদান করুন")
+            return
+        }
+        val duplicateLoanSameWeek = _loans.value.any { existing ->
+            val sameMember = (loan.memberId.isNotBlank() && existing.memberId == loan.memberId) ||
+                existing.memberName.trim().equals(loan.memberName.trim(), ignoreCase = true)
+            sameMember && com.example.util.SavingsAndFineCalculator.isSameWeek(existing.loanDate, loan.loanDate)
+        }
+        if (duplicateLoanSameWeek) {
+            onError("এই সদস্যের জন্য এই সপ্তাহে (${loan.loanDate}) ইতিমধ্যেই ঋণ বিতরণ করা হয়েছে। এক সপ্তাহে দুইবার সাবমিট করা যাবে না।")
+            return
+        }
+
+        val resolvedMemberId = loan.memberId.ifBlank { "loan_mem_${System.currentTimeMillis()}" }
+        val resolvedSerial = loan.memberSerial.ifBlank {
+            "ঋণ-${com.example.util.BengaliUtils.toBengaliDigits(_loans.value.size + 1)}"
+        }
+        val totalPayable = com.example.util.LoanCalculator.calculateTotalPayable(loan.principal, loan.interest)
+        val nextDate = loan.nextInstallmentDate.ifBlank {
+            com.example.util.BengaliUtils.addDaysToDateStr(loan.loanDate, 7)
+        }
+        val localId = loan.id.ifBlank { "loan_${System.currentTimeMillis()}" }
+        val savedLoan = loan.copy(
+            id = localId,
+            memberId = resolvedMemberId,
+            memberSerial = resolvedSerial,
+            totalPayable = totalPayable,
+            remainingLoan = totalPayable,
+            totalPaid = 0.0,
+            nextInstallmentDate = nextDate,
+            status = LoanStatus.ACTIVE.name,
+            createdBy = currentUserId
+        )
+
+        viewModelScope.launch {
+            _isSavingLoan.value = true
+            try {
+                if (alsoAddMember != null) {
+                    val memberToSave = alsoAddMember.copy(
+                        id = resolvedMemberId,
+                        memberSerial = resolvedSerial,
+                        createdBy = currentUserId
+                    )
+                    val updatedMembers = (_members.value + memberToSave)
+                        .distinctBy { it.id }
+                        .sortedBy {
+                            it.memberSerial.filter { ch -> ch.isDigit() }.toIntOrNull() ?: Int.MAX_VALUE
+                        }
+                    _members.value = updatedMembers
+                    _membersUiState.value = UiState.Success(updatedMembers)
+                    repository.saveLocalMembers(updatedMembers)
+                    if (repository.getCurrentUser() != null) {
+                        repository.addMember(memberToSave)
+                    }
+                }
+
+                val updatedLoans = (listOf(savedLoan) + _loans.value).distinctBy { it.id }
+                _loans.value = updatedLoans
+                repository.saveLocalLoans(updatedLoans)
+
+                val prevBalance = _fundLedger.value.lastOrNull()?.balance ?: 0.0
+                val newLedger = FundLedgerEntry(
+                    id = "ledger_$localId",
+                    date = savedLoan.loanDate,
+                    description = "ঋণ বিতরণ (${savedLoan.memberName})",
+                    moneyIn = 0.0,
+                    moneyOut = savedLoan.principal,
+                    balance = prevBalance - savedLoan.principal,
+                    referenceId = localId,
+                    type = LedgerType.LOAN_DISBURSEMENT.name,
+                    createdBy = currentUserId
+                )
+                val updatedLedger = _fundLedger.value + newLedger
+                _fundLedger.value = updatedLedger
+                repository.saveLocalFundLedger(updatedLedger)
+
+                if (repository.getCurrentUser() != null) {
+                    repository.createLoan(savedLoan)
+                }
+                onSuccess()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                onError(e.localizedMessage ?: "ঋণ বিতরণ এন্ট্রি ব্যর্থ হয়েছে")
+            } finally {
+                _isSavingLoan.value = false
+            }
+        }
+    }
+
+    fun recordLoanInstallment(loan: Loan, date: String, amount: Double, onSuccess: () -> Unit, onError: (String) -> Unit) {
+        if (amount <= 0.0) {
+            onError("কিস্তির পরিমাণ শূন্যের বেশি হতে হবে")
+            return
+        }
+        val cleanDate = com.example.util.DailyAccountCalculator.normalizeDateKey(date).ifBlank { date.trim() }
+        val duplicateSameDateOrWeek = _loanInstallments.value.any { existing ->
+            existing.loanId == loan.id &&
+                existing.status != TransactionStatus.REJECTED.name &&
+                (com.example.util.DailyAccountCalculator.normalizeDateKey(existing.installmentDate) == cleanDate ||
+                    com.example.util.SavingsAndFineCalculator.isSameWeek(existing.installmentDate, cleanDate))
+        }
+        if (duplicateSameDateOrWeek) {
+            onError("এই ঋণের কিস্তি এই তারিখে ($cleanDate) ইতিমধ্যেই সাবমিট করা হয়েছে। এক তারিখে দুইবার সাবমিট করা যাবে না।")
+            return
+        }
+        val isOfficer = _userRole.value == UserRole.FIELD_OFFICER
+        val officerName = _currentUserProfile.value?.displayName ?: if (isOfficer) "মাঠ কর্মকর্তা" else "অ্যাডমিন"
+        val status = if (isOfficer) TransactionStatus.PENDING.name else TransactionStatus.APPROVED.name
+        val deterministicInstId = "inst_${loan.id}_${cleanDate.replace("/", "-")}"
+        val serial = com.example.util.BengaliUtils.toBengaliDigits(
+            _loanInstallments.value.count { it.loanId == loan.id } + 1
+        )
+        val newInst = LoanInstallment(
+            id = deterministicInstId,
+            loanId = loan.id,
+            memberId = loan.memberId,
+            memberName = loan.memberName,
+            serialNumber = serial,
+            installmentDate = cleanDate,
+            amount = amount,
+            officerId = currentUserId,
+            officerName = officerName,
+            status = status,
+            createdBy = currentUserId,
+            approvedBy = if (status == TransactionStatus.APPROVED.name) currentUserId else ""
+        )
+
+        val updatedInsts = (_loanInstallments.value + newInst).distinctBy { it.id }
+        _loanInstallments.value = updatedInsts
+        repository.saveLocalLoanInstallments(updatedInsts)
+
+        if (!isOfficer) {
+            val nextDate = com.example.util.BengaliUtils.addDaysToDateStr(cleanDate, 7)
+            val updatedLoans = _loans.value.map { existing ->
+                if (existing.id == loan.id) {
+                    val catchUp = com.example.util.SavingsAndFineCalculator.calculateLoanCatchUp(existing, amount)
+                    val newStatus = if (catchUp.isFullyPaid) LoanStatus.PAID.name else LoanStatus.ACTIVE.name
+                    existing.copy(
+                        totalPaid = catchUp.newTotalPaid,
+                        remainingLoan = catchUp.newRemainingLoan,
+                        missedInstallments = catchUp.remainingMissedInstallments,
+                        nextInstallmentDate = nextDate,
+                        status = newStatus
+                    )
+                } else existing
+            }
+            _loans.value = updatedLoans
+            repository.saveLocalLoans(updatedLoans)
+
+            val prevBalance = _fundLedger.value.lastOrNull()?.balance ?: 0.0
+            val updatedLedger = _fundLedger.value + FundLedgerEntry(
+                id = "ledger_$deterministicInstId",
+                date = cleanDate,
+                description = "ঋণের কিস্তি আদায় (${loan.memberName})",
+                moneyIn = amount,
+                moneyOut = 0.0,
+                balance = prevBalance + amount,
+                referenceId = deterministicInstId,
+                type = LedgerType.LOAN_INSTALLMENT.name,
+                createdBy = currentUserId
+            )
+            _fundLedger.value = updatedLedger
+            repository.saveLocalFundLedger(updatedLedger)
+        }
+
+        if (repository.getCurrentUser() == null) {
+            if (isOfficer) {
+                notifyAdminOfOfficerSubmission(
+                    title = "নতুন ঋণ কিস্তি অনুমোদনের অনুরোধ",
+                    body = "$officerName সদস্য ${loan.memberName}-এর ৳${amount.toInt()} ঋণের কিস্তি ($cleanDate) পাঠিয়েছেন।",
+                    transactionType = "LOAN_INSTALLMENT",
+                    transactionId = deterministicInstId,
+                    memberName = loan.memberName,
+                    amount = amount,
+                    officerName = officerName
+                )
+            }
+            onSuccess()
+            return
+        }
+
+        viewModelScope.launch {
+            try {
+                // Stage in Room first for offline guarantee & duplicate prevention across connectivity drops
+                val enqueued = repository.enqueueOfflineLoanInstallment(newInst, isOfficer)
+                if (!enqueued) {
+                    onError("এই ঋণের কিস্তি অফলাইন কিউতে ইতিমধ্যেই এই সপ্তাহে সংরক্ষিত রয়েছে।")
+                    return@launch
+                }
+
+                if (repository.isOnline()) {
+                    repository.recordLoanInstallment(loan, cleanDate, amount, isOfficer, officerName)
+                    if (isOfficer) {
+                        notifyAdminOfOfficerSubmission(
+                            title = "নতুন ঋণ কিস্তি অনুমোদনের অনুরোধ",
+                            body = "$officerName সদস্য ${loan.memberName}-এর ৳${amount.toInt()} ঋণের কিস্তি ($cleanDate) পাঠিয়েছেন।",
+                            transactionType = "LOAN_INSTALLMENT",
+                            transactionId = deterministicInstId,
+                            memberName = loan.memberName,
+                            amount = amount,
+                            officerName = officerName
+                        )
+                    }
+                    repository.markRoomTransactionSynced(deterministicInstId)
+                }
+                onSuccess()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                onError(e.localizedMessage ?: "কিস্তি এন্ট্রি ব্যর্থ")
+            }
+        }
+    }
+
+    fun recordMissedLoanInstallment(loan: Loan, missedDate: String, onSuccess: () -> Unit, onError: (String) -> Unit) {
+        if (_userRole.value != UserRole.ADMIN) {
+            onError("শুধুমাত্র অ্যাডমিন ঋণের বকেয়া ও জরিমানা আপডেট করতে পারবেন")
+            return
+        }
+        viewModelScope.launch {
+            try {
+                val officerName = _currentUserProfile.value?.displayName ?: "অ্যাডমিন"
+                val nextDueDate = com.example.util.BengaliUtils.addDaysToDateStr(missedDate, 7)
+                val fineRecord = com.example.util.SavingsAndFineCalculator.buildLoanFineRecord(
+                    loan = loan,
+                    missedDate = missedDate,
+                    appliedDate = nextDueDate,
+                    officerId = currentUserId,
+                    officerName = officerName
+                )
+
+                val instId = "inst_miss_${loan.id}_${missedDate.replace("/", "-")}_${System.currentTimeMillis()}"
+                val serial = com.example.util.BengaliUtils.toBengaliDigits(
+                    _loanInstallments.value.count { it.loanId == loan.id } + 1
+                )
+                val missedInst = LoanInstallment(
+                    id = instId,
+                    loanId = loan.id,
+                    memberId = loan.memberId,
+                    memberName = loan.memberName,
+                    serialNumber = serial,
+                    installmentDate = missedDate,
+                    amount = 0.0,
+                    isMissed = true,
+                    officerId = currentUserId,
+                    status = TransactionStatus.APPROVED.name,
+                    createdBy = currentUserId,
+                    approvedBy = currentUserId
+                )
+                val updatedInsts = _loanInstallments.value + missedInst
+                _loanInstallments.value = updatedInsts
+                repository.saveLocalLoanInstallments(updatedInsts)
+
+                val updatedLoans = _loans.value.map { existing ->
+                    if (existing.id == loan.id) {
+                        existing.copy(
+                            missedInstallments = existing.missedInstallments + 1,
+                            nextInstallmentDate = nextDueDate
+                        )
+                    } else existing
+                }
+                _loans.value = updatedLoans
+                repository.saveLocalLoans(updatedLoans)
+
+                mergeGeneratedFinesLocally(listOf(fineRecord))
+
+                if (repository.getCurrentUser() != null) {
+                    repository.recordMissedLoanInstallment(loan, missedDate, docId = instId)
+                    repository.upsertFinesBatch(listOf(fineRecord))
+                }
+                onSuccess()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                onError(e.localizedMessage ?: "ঋণের বাকি ও জরিমানা সংরক্ষণ ব্যর্থ")
+            }
+        }
+    }
+
+    fun approveLoanInstallment(installment: LoanInstallment, onSuccess: () -> Unit, onError: (String) -> Unit) {
+        if (_userRole.value != UserRole.ADMIN) {
+            onError("অনুমোদন শুধুমাত্র অ্যাডমিন করতে পারবেন")
+            return
+        }
+        val updatedInsts = _loanInstallments.value.map {
+            if (it.id == installment.id) {
+                it.copy(status = TransactionStatus.APPROVED.name, approvedBy = currentUserId)
+            } else it
+        }
+        _loanInstallments.value = updatedInsts
+        repository.saveLocalLoanInstallments(updatedInsts)
+
+        val updatedLoans = _loans.value.map { existing ->
+            if (existing.id == installment.loanId) {
+                val catchUp = com.example.util.SavingsAndFineCalculator.calculateLoanCatchUp(existing, installment.amount)
+                val newStatus = if (catchUp.isFullyPaid) LoanStatus.PAID.name else LoanStatus.ACTIVE.name
+                existing.copy(
+                    totalPaid = catchUp.newTotalPaid,
+                    remainingLoan = catchUp.newRemainingLoan,
+                    missedInstallments = catchUp.remainingMissedInstallments,
+                    nextInstallmentDate = com.example.util.BengaliUtils.addDaysToDateStr(installment.installmentDate, 7),
+                    status = newStatus
+                )
+            } else existing
+        }
+        _loans.value = updatedLoans
+        repository.saveLocalLoans(updatedLoans)
+
+        val prevBalance = _fundLedger.value.lastOrNull()?.balance ?: 0.0
+        val updatedLedger = _fundLedger.value + FundLedgerEntry(
+            id = "ledger_app_${installment.id}",
+            date = installment.installmentDate,
+            description = "ঋণের কিস্তি আদায় (${installment.memberName})",
+            moneyIn = installment.amount,
+            moneyOut = 0.0,
+            balance = prevBalance + installment.amount,
+            referenceId = installment.id,
+            type = LedgerType.LOAN_INSTALLMENT.name,
+            createdBy = currentUserId
+        )
+        _fundLedger.value = updatedLedger
+        repository.saveLocalFundLedger(updatedLedger)
+
+        if (repository.getCurrentUser() == null) {
+            onSuccess()
+            return
+        }
+        viewModelScope.launch {
+            try {
+                repository.approveLoanInstallment(installment)
+                onSuccess()
+            } catch (e: Exception) {
+                onError(e.message ?: "অনুমোদন ব্যর্থ")
+            }
+        }
+    }
+
+    // Fine Sheet actions (10 BDT separate from principal savings & loans)
+    fun addManualFine(
+        member: Member,
+        fineType: FineType,
+        missedDate: String,
+        fineDate: String,
+        amount: Double = com.example.util.SavingsAndFineCalculator.DEFAULT_WEEKLY_FINE_AMOUNT,
+        isPaid: Boolean = false,
+        onSuccess: () -> Unit,
+        onError: (String) -> Unit
+    ) {
+        if (amount <= 0.0) {
+            onError("জরিমানার পরিমাণ শূন্যের বেশি হতে হবে")
+            return
+        }
+        val cleanFineDate = com.example.util.DailyAccountCalculator.normalizeDateKey(fineDate).ifBlank { fineDate.trim() }
+        val cleanMissedDate = com.example.util.DailyAccountCalculator.normalizeDateKey(missedDate).ifBlank { cleanFineDate }
+        val duplicateSameDateOrWeek = _fines.value.any { existing ->
+            existing.status != TransactionStatus.REJECTED.name &&
+                existing.fineType == fineType.name &&
+                (existing.memberId == member.id || (member.id.isBlank() && existing.memberName == member.name)) &&
+                (com.example.util.DailyAccountCalculator.normalizeDateKey(existing.fineDate) == cleanFineDate ||
+                    com.example.util.SavingsAndFineCalculator.isSameWeek(existing.fineDate, cleanFineDate))
+        }
+        if (duplicateSameDateOrWeek) {
+            val typeLabel = if (fineType == FineType.SAVINGS) "সঞ্চয়" else "ঋণ"
+            onError("এই সদস্যের ($cleanFineDate) তারিখে $typeLabel জরিমানা ইতিমধ্যেই সাবমিট করা হয়েছে। এক তারিখে দুইবার সাবমিট করা যাবে না।")
+            return
+        }
+        val officerName = _currentUserProfile.value?.displayName ?: "অ্যাডমিন"
+        val keyPart = member.id.ifBlank { member.name }
+        val fineId = "fine_${fineType.name.lowercase()}_${keyPart}_${cleanFineDate.replace("/", "-")}"
+        val newFine = FineRecord(
+            id = fineId,
+            memberId = member.id,
+            memberName = member.name,
+            memberSerial = member.memberSerial,
+            fineDate = cleanFineDate,
+            missedDate = cleanMissedDate,
+            fineType = fineType.name,
+            amount = amount,
+            isPaid = isPaid,
+            paidDate = if (isPaid) com.example.util.BengaliUtils.getCurrentDateStr() else "",
+            referenceId = "",
+            officerId = currentUserId,
+            officerName = officerName,
+            status = TransactionStatus.APPROVED.name,
+            createdBy = currentUserId
+        )
+
+        val updated = (_fines.value + newFine).distinctBy { it.id }
+        _fines.value = updated
+        repository.saveLocalFines(updated)
+        if (repository.getCurrentUser() == null) {
+            onSuccess()
+            return
+        }
+        onSuccess()
+        viewModelScope.launch {
+            try {
+                repository.upsertFinesBatch(listOf(newFine))
+            } catch (e: Exception) {
+                onError(e.localizedMessage ?: "জরিমানা সংরক্ষণে সমস্যা হয়েছে")
+            }
+        }
+    }
+
+    fun toggleFinePaid(fine: FineRecord, isPaid: Boolean, onSuccess: () -> Unit = {}, onError: (String) -> Unit = {}) {
+        if (_userRole.value != UserRole.ADMIN) {
+            onError("জরিমানা সংশোধন শুধুমাত্র অ্যাডমিন করতে পারবেন")
+            return
+        }
+        val today = com.example.util.BengaliUtils.getCurrentDateStr()
+        val updated = _fines.value.map {
+            if (it.id == fine.id) it.copy(isPaid = isPaid, paidDate = if (isPaid) today else "") else it
+        }
+        _fines.value = updated
+        repository.saveLocalFines(updated)
+        if (repository.getCurrentUser() == null) {
+            onSuccess()
+            return
+        }
+        onSuccess()
+        viewModelScope.launch {
+            try {
+                repository.updateFinePaymentStatus(fine.id, isPaid, today)
+            } catch (e: Exception) {
+                onError(e.localizedMessage ?: "জরিমানা আপডেট ব্যর্থ")
+            }
+        }
+    }
+
+    private fun isAuthorizedAdminForDelete(): Boolean {
+        val sessionRole = _currentUserProfile.value?.role ?: AuthSession.currentUserProfile?.role
+        return _userRole.value == UserRole.ADMIN && sessionRole == UserRole.ADMIN.name
+    }
+
+    fun deleteFine(fineId: String, onSuccess: () -> Unit = {}, onError: (String) -> Unit = {}) {
+        if (!isAuthorizedAdminForDelete()) {
+            onError("জরিমানা ডিলিট করার অনুমতি শুধুমাত্র অ্যাডমিনের আছে")
+            return
+        }
+        deletedDocIds.add(fineId)
+        val updated = _fines.value.filterNot { it.id == fineId }
+        _fines.value = updated
+        repository.saveLocalFines(updated)
+        if (repository.getCurrentUser() == null) {
+            onSuccess()
+            return
+        }
+        viewModelScope.launch {
+            try {
+                repository.deleteFine(fineId)
+                onSuccess()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                onError(e.localizedMessage ?: "জরিমানা ডিলিট করতে সমস্যা হয়েছে")
+            }
+        }
+    }
+
+    fun deleteMember(memberId: String, onSuccess: () -> Unit = {}, onError: (String) -> Unit = {}) {
+        if (!isAuthorizedAdminForDelete()) {
+            onError("সদস্য ডিলিট করার অনুমতি শুধুমাত্র অ্যাডমিনের আছে")
+            return
+        }
+        deletedDocIds.add(memberId)
+        val updated = _members.value.filterNot { it.id == memberId }
+        _members.value = updated
+        _membersUiState.value = UiState.Success(updated)
+        repository.saveLocalMembers(updated)
+        if (repository.getCurrentUser() == null) {
+            onSuccess()
+            return
+        }
+        viewModelScope.launch {
+            try {
+                repository.deleteMember(memberId)
+                onSuccess()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                onError(e.localizedMessage ?: "সদস্য ডিলিট করতে সমস্যা হয়েছে")
+            }
+        }
+    }
+
+    fun deleteSavingsRecord(recordId: String, onSuccess: () -> Unit = {}, onError: (String) -> Unit = {}) {
+        if (!isAuthorizedAdminForDelete()) {
+            onError("সঞ্চয় এন্ট্রি ডিলিট করার অনুমতি শুধুমাত্র অ্যাডমিনের আছে")
+            return
+        }
+        deletedDocIds.add(recordId)
+        val updated = _savingsRecords.value.filterNot { it.id == recordId }
+        _savingsRecords.value = updated
+        repository.saveLocalSavings(updated)
+        if (repository.getCurrentUser() == null) {
+            onSuccess()
+            return
+        }
+        viewModelScope.launch {
+            try {
+                repository.deleteSavingsRecord(recordId)
+                onSuccess()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                onError(e.localizedMessage ?: "সঞ্চয় এন্ট্রি ডিলিট করতে সমস্যা হয়েছে")
+            }
+        }
+    }
+
+    fun deleteLoan(loanId: String, onSuccess: () -> Unit = {}, onError: (String) -> Unit = {}) {
+        if (!isAuthorizedAdminForDelete()) {
+            onError("ঋণ এন্ট্রি ডিলিট করার অনুমতি শুধুমাত্র অ্যাডমিনের আছে")
+            return
+        }
+        deletedDocIds.add(loanId)
+        val updated = _loans.value.filterNot { it.id == loanId }
+        _loans.value = updated
+        repository.saveLocalLoans(updated)
+        if (repository.getCurrentUser() == null) {
+            onSuccess()
+            return
+        }
+        viewModelScope.launch {
+            try {
+                repository.deleteLoan(loanId)
+                onSuccess()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                onError(e.localizedMessage ?: "ঋণ ডিলিট করতে সমস্যা হয়েছে")
+            }
+        }
+    }
+
+    fun deleteLoanInstallment(installmentId: String, onSuccess: () -> Unit = {}, onError: (String) -> Unit = {}) {
+        if (!isAuthorizedAdminForDelete()) {
+            onError("কিস্তি এন্ট্রি ডিলিট করার অনুমতি শুধুমাত্র অ্যাডমিনের আছে")
+            return
+        }
+        deletedDocIds.add(installmentId)
+        val updated = _loanInstallments.value.filterNot { it.id == installmentId }
+        _loanInstallments.value = updated
+        repository.saveLocalLoanInstallments(updated)
+        if (repository.getCurrentUser() == null) {
+            onSuccess()
+            return
+        }
+        viewModelScope.launch {
+            try {
+                repository.deleteLoanInstallment(installmentId)
+                onSuccess()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                onError(e.localizedMessage ?: "কিস্তি ডিলিট করতে সমস্যা হয়েছে")
+            }
+        }
+    }
+
+    fun deleteLedgerEntry(entryId: String, onSuccess: () -> Unit = {}, onError: (String) -> Unit = {}) {
+        if (!isAuthorizedAdminForDelete()) {
+            onError("লেজার এন্ট্রি ডিলিট করার অনুমতি শুধুমাত্র অ্যাডমিনের আছে")
+            return
+        }
+        deletedDocIds.add(entryId)
+        val updated = _fundLedger.value.filterNot { it.id == entryId }
+        _fundLedger.value = updated
+        repository.saveLocalFundLedger(updated)
+        if (repository.getCurrentUser() == null) {
+            onSuccess()
+            return
+        }
+        viewModelScope.launch {
+            try {
+                repository.deleteLedgerEntry(entryId)
+                onSuccess()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                onError(e.localizedMessage ?: "লেজার এন্ট্রি ডিলিট করতে সমস্যা হয়েছে")
+            }
+        }
+    }
+
+    // Ledger actions
+    fun addLedgerEntry(date: String, desc: String, moneyIn: Double, moneyOut: Double, onSuccess: () -> Unit, onError: (String) -> Unit) {
+        if (_userRole.value != UserRole.ADMIN) {
+            onError("লেজার এন্ট্রি শুধুমাত্র অ্যাডমিন করতে পারবেন")
+            return
+        }
+        val ledgerId = "ledger_${System.currentTimeMillis()}"
+        val prevBalance = _fundLedger.value.lastOrNull()?.balance ?: 0.0
+        val updatedLedger = _fundLedger.value + FundLedgerEntry(
+            id = ledgerId,
+            date = date,
+            description = desc,
+            moneyIn = moneyIn,
+            moneyOut = moneyOut,
+            balance = prevBalance + moneyIn - moneyOut,
+            type = if (moneyOut > 0.0 && moneyIn == 0.0) LedgerType.EXPENSE.name else LedgerType.DEPOSIT.name,
+            createdBy = currentUserId
+        )
+        _fundLedger.value = updatedLedger
+        repository.saveLocalFundLedger(updatedLedger)
+        if (repository.getCurrentUser() == null) {
+            onSuccess()
+            return
+        }
+        viewModelScope.launch {
+            try {
+                repository.appendLedgerEntry(date, desc, moneyIn, moneyOut, docId = ledgerId)
+                onSuccess()
+            } catch (e: Exception) {
+                onError(e.message ?: "লেজার এন্ট্রি ব্যর্থ")
+            }
+        }
+    }
+
+    // User management
+    fun updateUserRole(userId: String, role: String, area: String, isActive: Boolean, onSuccess: () -> Unit, onError: (String) -> Unit) {
+        if (_userRole.value != UserRole.ADMIN) {
+            onError("ব্যবহারকারী রোল পরিবর্তন শুধুমাত্র অ্যাডমিন করতে পারবেন")
+            return
+        }
+        viewModelScope.launch {
+            try {
+                repository.updateUserRole(userId, role, area, isActive)
+                onSuccess()
+            } catch (e: Exception) {
+                onError(e.message ?: "রোল আপডেট ব্যর্থ")
+            }
+        }
+    }
+
+    fun updateSettings(settings: AppSettings, onSuccess: () -> Unit, onError: (String) -> Unit) {
+        if (_userRole.value != UserRole.ADMIN) {
+            onError("সেটিংস পরিবর্তন শুধুমাত্র অ্যাডমিন করতে পারবেন")
+            return
+        }
+        _appSettings.value = settings
+        repository.saveLocalAppSettings(settings)
+        onSuccess()
+        viewModelScope.launch {
+            try {
+                if (repository.getCurrentUser() != null) {
+                    repository.updateAppSettings(settings)
+                }
+            } catch (e: Exception) {
+                onError(e.message ?: "সেটিংস আপডেট ব্যর্থ")
+            }
+        }
+    }
+
+    // FCM Token & Admin Approval Notification Helpers
+    fun registerAdminFcmToken(token: String) {
+        if (AuthSession.currentUserProfile?.role != UserRole.ADMIN.name && _userRole.value != UserRole.ADMIN) {
+            return
+        }
+        viewModelScope.launch {
+            repository.registerAdminFcmToken(token)
+        }
+    }
+
+    fun markAdminNotificationRead(notificationId: String) {
+        if (notificationId.isBlank()) return
+        val updated = _pendingAdminNotifications.value.filterNot { it.id == notificationId }
+        _pendingAdminNotifications.value = updated
+        if (repository.getCurrentUser() == null) {
+            val all = repository.loadLocalAdminNotifications().map {
+                if (it.id == notificationId) it.copy(isRead = true) else it
+            }
+            repository.saveLocalAdminNotifications(all)
+            return
+        }
+        viewModelScope.launch {
+            repository.markAdminNotificationRead(notificationId)
+        }
+    }
+
+    private fun notifyAdminOfOfficerSubmission(
+        title: String,
+        body: String,
+        transactionType: String,
+        transactionId: String,
+        memberName: String,
+        amount: Double,
+        officerName: String
+    ) {
+        if (repository.getCurrentUser() == null) {
+            val newNotif = AdminNotification(
+                id = "notif_${System.currentTimeMillis()}",
+                title = title,
+                body = body,
+                transactionType = transactionType,
+                transactionId = transactionId,
+                memberName = memberName,
+                amount = amount,
+                officerId = currentUserId,
+                officerName = officerName,
+                targetRole = UserRole.ADMIN.name,
+                targetTopic = "admin_approvals",
+                targetScreen = "APPROVALS",
+                deepLink = "ekotasamiti://approvals",
+                isRead = false
+            )
+            val all = repository.loadLocalAdminNotifications() + newNotif
+            repository.saveLocalAdminNotifications(all)
+            _pendingAdminNotifications.value = all.filter { !it.isRead }
+            return
+        }
+
+        viewModelScope.launch {
+            try {
+                repository.enqueueAdminApprovalNotification(
+                    title = title,
+                    body = body,
+                    transactionType = transactionType,
+                    transactionId = transactionId,
+                    memberName = memberName,
+                    amount = amount,
+                    officerName = officerName
+                )
+            } catch (_: Exception) {
+                // Non-fatal
+            }
+        }
+    }
+
+    fun resetAllDataToZero(
+        onSuccess: () -> Unit,
+        onError: (String) -> Unit
+    ) {
+        if (!isAuthorizedAdminForDelete()) {
+            onError("সব ডাটা রিসেট করার অনুমতি শুধুমাত্র অ্যাডমিনের আছে")
+            return
+        }
+
+        viewModelScope.launch {
+            try {
+                if (repository.getCurrentUser() != null) {
+                    if (!repository.isOnline()) {
+                        onError("ইন্টারনেট সংযোগ ছাড়া ক্লাউড ডাটা রিসেট করা যাবে না")
+                        return@launch
+                    }
+                    repository.resetAllCloudData()
+                }
+                repository.clearAllLocalData()
+                repository.clearAllRoomData()
+                deletedDocIds.clear()
+
+                _members.value = emptyList()
+                _membersUiState.value = UiState.Success(emptyList())
+                _savingsRecords.value = emptyList()
+                _collectionPeriods.value = emptyList()
+                _loans.value = emptyList()
+                _loanInstallments.value = emptyList()
+                _fines.value = emptyList()
+                _fundLedger.value = emptyList()
+                _pendingAdminNotifications.value = emptyList()
+                onSuccess()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                onError(e.localizedMessage ?: "সব ডাটা রিসেট করতে সমস্যা হয়েছে")
+            }
+        }
+    }
+
+    fun generateAiCallPlan(customInstruction: String = "") {
+        viewModelScope.launch {
+            _aiCallUiState.value = AiCallUiState.Loading
+            try {
+                val result = aiCallAssistantService.buildCallPlan(
+                    orgName = _appSettings.value.orgName,
+                    members = _members.value,
+                    savingsRecords = _savingsRecords.value,
+                    loans = _loans.value,
+                    fines = _fines.value,
+                    customInstruction = customInstruction
+                )
+                _aiCallUiState.value = AiCallUiState.Success(result)
+            } catch (e: TimeoutCancellationException) {
+                Log.e("MainViewModel", "AI call plan timed out", e)
+                _aiCallUiState.value = AiCallUiState.Error(
+                    "AI কল তালিকা তৈরি করতে ৬০ সেকেন্ডের বেশি সময় লেগেছে। অনুগ্রহ করে আবার চেষ্টা করুন।"
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e("MainViewModel", "AI call plan generation failed", e)
+                _aiCallUiState.value = AiCallUiState.Error(
+                    e.localizedMessage ?: "AI কল তালিকা তৈরি করা যায়নি"
+                )
+            }
+        }
+    }
+
+    fun resetAiCallState() {
+        _aiCallUiState.value = AiCallUiState.Idle
+    }
+
+    fun dismissUpdateBanner() {
+        _updateBannerDismissed.value = true
+    }
+
+    fun toggleAutoUpdateEnabled(enabled: Boolean) {
+        val updated = _appSettings.value.copy(autoUpdateEnabled = enabled)
+        _appSettings.value = updated
+        repository.saveLocalAppSettings(updated)
+        if (_userRole.value == UserRole.ADMIN && repository.getCurrentUser() != null) {
+            viewModelScope.launch {
+                try {
+                    repository.updateAppSettings(updated)
+                } catch (_: Exception) {
+                }
+            }
+        }
+        if (enabled) {
+            checkForAppUpdates(force = true)
+        } else {
+            _lastUpdateStatusMessage.value = "স্বয়ংক্রিয় আপডেট যাচাই বন্ধ করা হয়েছে"
+        }
+    }
+
+    fun checkForAppUpdates(
+        force: Boolean = false,
+        onResult: (AppUpdateInfo?, String) -> Unit = { _, _ -> }
+    ) {
+        if (!force && !_appSettings.value.autoUpdateEnabled) return
+        if (_isCheckingUpdate.value && !force) return
+        if (!repository.isOnline()) {
+            val offlineMsg = "আপডেট যাচাই করতে ইন্টারনেট সংযোগ প্রয়োজন"
+            if (force) {
+                _lastUpdateStatusMessage.value = offlineMsg
+                onResult(null, offlineMsg)
+            }
+            return
+        }
+        viewModelScope.launch {
+            _isCheckingUpdate.value = true
+            try {
+                val info = AppUpdateChecker.checkForAvailableUpdate(settings = _appSettings.value)
+                _availableUpdate.value = info
+                if (force && info != null) {
+                    _updateBannerDismissed.value = false
+                }
+                val message = if (info != null) {
+                    "নতুন আপডেট পাওয়া গেছে: v${info.latestVersionName}"
+                } else {
+                    "আপনি সর্বশেষ সংস্করণই ব্যবহার করছেন ✓"
+                }
+                _lastUpdateStatusMessage.value = message
+                onResult(info, message)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                val errMsg = "আপডেট যাচাই করা যায়নি"
+                if (force) {
+                    _lastUpdateStatusMessage.value = errMsg
+                    onResult(null, errMsg)
+                }
+            } finally {
+                _isCheckingUpdate.value = false
+            }
+        }
+    }
+
+    fun exportFullBackupJson(): String {
+        return BackupManager.createFullBackupJson(
+            members = _members.value,
+            savings = _savingsRecords.value,
+            collectionPeriods = _collectionPeriods.value,
+            loans = _loans.value,
+            loanInstallments = _loanInstallments.value,
+            fines = _fines.value,
+            ledger = _fundLedger.value,
+            appSettings = _appSettings.value
+        )
+    }
+
+    fun restoreBackupFromJson(
+        rawJson: String,
+        onSuccess: (Int) -> Unit,
+        onError: (String) -> Unit
+    ) {
+        if (_userRole.value != UserRole.ADMIN) {
+            onError("ব্যাকআপ রিস্টোর শুধুমাত্র অ্যাডমিন করতে পারবেন")
+            return
+        }
+        val parsed = BackupManager.parseBackupJson(rawJson).getOrElse { err ->
+            onError(err.message ?: "ব্যাকআপ ফাইল পড়া যায়নি")
+            return
+        }
+        if (parsed.totalRecordsCount == 0 && parsed.appSettings == null) {
+            onError("ব্যাকআপ ফাইলে কোনো সংরক্ষিত রেকর্ড পাওয়া যায়নি")
+            return
+        }
+
+        viewModelScope.launch {
+            try {
+                if (repository.getCurrentUser() == null) {
+                    repository.mergeRestoredLocalBackup(parsed)
+                    _members.value = repository.loadLocalMembers()
+                    _membersUiState.value = UiState.Success(_members.value)
+                    _savingsRecords.value = repository.loadLocalSavings()
+                    _collectionPeriods.value = repository.loadLocalCollectionPeriods()
+                    _loans.value = repository.loadLocalLoans()
+                    _loanInstallments.value = repository.loadLocalLoanInstallments()
+                    _fines.value = repository.loadLocalFines()
+                    _fundLedger.value = repository.loadLocalFundLedger()
+                    _appSettings.value = repository.loadLocalAppSettings()
+                    onSuccess(parsed.totalRecordsCount)
+                } else {
+                    val count = repository.restoreBackupToCloud(parsed, isAdmin = true)
+                    if (parsed.members.isNotEmpty()) {
+                        repository.cacheMembersInRoom((_members.value + parsed.members).distinctBy { it.id })
+                    }
+                    if (parsed.loans.isNotEmpty()) {
+                        repository.cacheLoansInRoom((_loans.value + parsed.loans).distinctBy { it.id })
+                    }
+                    onSuccess(count)
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                onError(e.localizedMessage ?: "ব্যাকআপ রিস্টোর করা যায়নি")
+            }
+        }
+    }
+}
+
+class MainViewModelFactory(
+    private val repository: EkotaRepository,
+    private val currentUserId: String
+) : ViewModelProvider.Factory {
+    @Suppress("UNCHECKED_CAST")
+    override fun <T : ViewModel> create(modelClass: Class<T>): T {
+        return MainViewModel(repository, currentUserId) as T
+    }
+}
